@@ -7,4 +7,6 @@ matplotlib
 statsmodels
 scipy
 seaborn
+scikit-learn
+networkx
 jupyter
