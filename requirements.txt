@@ -1,0 +1,10 @@
+pandas
+pandas-datareader
+pyarrow
+fastparquet
+openpyxl
+matplotlib
+statsmodels
+scipy
+seaborn
+jupyter
