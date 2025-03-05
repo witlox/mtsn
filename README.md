@@ -16,3 +16,8 @@ python wikip.py
 python uci.py
 ```
 
+# Run the notebook
+
+```bash
+jupyter notebook MTSN.ipynb
+```
