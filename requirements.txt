@@ -1,4 +1,3 @@
-numpy==1.26.4
 pandas
 pandas-datareader
 pyarrow
@@ -10,6 +9,5 @@ scipy
 seaborn
 scikit-learn
 networkx
-pmdarima
-prophet
+python-louvain
 jupyter

@@ -1,591 +1,612 @@
-import warnings
-from datetime import timedelta, datetime
+from typing import Dict, List, Tuple, Optional
 
+import networkx as nx
 import numpy as np
 import pandas as pd
-import networkx as nx
-
-from statsmodels.tsa.seasonal import STL
-from scipy.stats import zscore
+from community import community_louvain
+from scipy.linalg import eigh
+from scipy.optimize import minimize
+from sklearn.cluster import KMeans
+from statsmodels.tsa.seasonal import MSTL  # Changed from STL to MSTL
 
 
 class MTSN:
     """
-    Multi-Layer Temporal-Seasonal Network (MTSN) for KPI Analysis.
-
-    This class implements the MTSN framework as described in the paper:
-    "Multi-Layer Temporal-Seasonal Network for KPI Analysis" by P. Witlox.
+    A class implementing the mathematical framework for network-based analysis of KPIs.
+    Handles temporal dependencies, community detection, and key influencer identification.
+    Uses MSTL for multiple seasonal time series decomposition.
     """
 
-    def __init__(self, data=None, dates=None, seasonal_periods=None, trend_window=None):
+    def __init__(self, alpha: float = 0.1, beta: float = 0.1, gamma: float = 0.1):
         """
-        Initialize the MTSN framework.
+        Initialize the KPI Network Analyzer.
 
         Parameters:
         -----------
-        data : array-like or pandas.Series
-            The time series data (KPI values)
-        dates : array-like or pandas.DatetimeIndex
-            The corresponding dates for the time series data
-        seasonal_periods : list of int or int
-            The periods of the seasonality components (e.g., [7, 30, 365] for weekly, monthly, and yearly)
-            If a single integer is provided, it will be converted to a list with one element
-        trend_window : int
-            The window length for the trend component in STL decomposition
+        alpha : float
+            Regularization parameter for the Frobenius norm in graph learning.
+        beta : float
+            Regularization parameter for the L1 norm in graph learning.
+        gamma : float
+            Regularization parameter for temporal consistency.
         """
-        self.data = data
-        self.dates = dates
-        if seasonal_periods is not None and not isinstance(seasonal_periods, list):
-            self.seasonal_periods = [seasonal_periods]
-        else:
-            self.seasonal_periods = seasonal_periods
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.kpi_data = None
+        self.decomposed_data = {}
+        self.graph_series = {}
+        self.adjacency_matrices = {}
+        self.laplacian_matrices = {}
+        self.communities = {}
+        self.centrality_measures = {}
 
-        self.trend_window = trend_window
+    def load_data(
+        self,
+        data: pd.DataFrame,
+        date_column: str = "date",
+        kpi_columns: Optional[List[str]] = None,
+    ) -> None:
+        """
+        Load KPI time series data.
 
-        # Initialize components
-        self.decomposition = None
-        self.graph = None
-        self.hotspots = None
+        Parameters:
+        -----------
+        data : pd.DataFrame
+            DataFrame containing KPI time series data.
+        date_column : str
+            Name of the column containing dates.
+        kpi_columns : List[str], optional
+            List of column names representing KPIs. If None, all columns except date_column are used.
+        """
+        if kpi_columns is None:
+            kpi_columns = [col for col in data.columns if col != date_column]
 
-        if data is not None and dates is not None and seasonal_periods is not None:
-            self._validate_inputs()
+        # Set date as index and extract only KPI columns
+        self.kpi_data = data.set_index(date_column)[kpi_columns].copy()
+        self.kpi_names = kpi_columns
+        self.n_kpis = len(kpi_columns)
 
-    def _validate_inputs(self):
-        """Validate input data and parameters."""
-        # Convert to pandas Series if needed
-        if not isinstance(self.data, pd.Series):
-            if self.dates is not None:
-                self.data = pd.Series(self.data, index=self.dates)
+        print(
+            f"Loaded data with {self.n_kpis} KPIs and {len(self.kpi_data)} time points."
+        )
+
+    def decompose_time_series(self, periods: List[int] = [12]) -> Dict:
+        """
+        Apply Multiple Seasonal-Trend decomposition using Loess (MSTL) to each KPI time series.
+
+        Parameters:
+        -----------
+        periods : List[int]
+            List of seasonal periods to consider. For example, [7, 30] for weekly and monthly seasonality.
+        robust : bool
+            Flag indicating whether to use robust fitting.
+
+        Returns:
+        --------
+        Dict : Dictionary containing decomposed components for each KPI.
+        """
+        self.decomposed_data = {}
+
+        for kpi in self.kpi_names:
+            if self.kpi_data[kpi].isnull().sum() > 0:
+                # Handle missing values with simple interpolation for decomposition
+                series = self.kpi_data[kpi].interpolate(method="linear")
             else:
-                self.data = pd.Series(self.data)
+                series = self.kpi_data[kpi]
 
-        # Ensure dates are in datetime format
-        if not isinstance(self.data.index, pd.DatetimeIndex):
+            # Apply MSTL decomposition
+            mstl = MSTL(series, periods=periods)
+            result = mstl.fit()
+
+            # Extract trend and residual components
+            trend = result.trend
+            residual = result.resid
+
+            # For MSTL, the seasonal component is a DataFrame with multiple columns for each seasonal period
+            # We'll store both combined and individual seasonal components
+            seasonal_combined = result.seasonal.sum(axis=1)
+
+            self.decomposed_data[kpi] = {
+                "trend": trend,
+                "seasonal": seasonal_combined,  # Combined seasonal components
+                "seasonal_components": result.seasonal,  # Individual seasonal components
+                "residual": residual,
+                "original": series,
+            }
+
+        print(
+            f"Multi-seasonal time series decomposition completed for {len(self.decomposed_data)} KPIs."
+        )
+        return self.decomposed_data
+
+    def compute_seasonal_similarity(self) -> pd.DataFrame:
+        """
+        Compute the seasonal similarity matrix between KPIs.
+
+        Returns:
+        --------
+        pd.DataFrame : Seasonal similarity matrix.
+        """
+        if not self.decomposed_data:
+            raise ValueError("Time series decomposition must be performed first.")
+
+        seasonal_sim = pd.DataFrame(index=self.kpi_names, columns=self.kpi_names)
+
+        for kpi1 in self.kpi_names:
+            for kpi2 in self.kpi_names:
+                seasonal1 = self.decomposed_data[kpi1]["seasonal"]
+                seasonal2 = self.decomposed_data[kpi2]["seasonal"]
+
+                # Calculate Pearson correlation between seasonal components
+                corr = np.corrcoef(seasonal1, seasonal2)[0, 1]
+                seasonal_sim.loc[kpi1, kpi2] = corr
+
+        return seasonal_sim
+
+    def _objective_function(
+        self, A_flat: np.ndarray, X: np.ndarray, A_prev: Optional[np.ndarray] = None
+    ) -> float:
+        """
+        Objective function for graph learning optimization.
+
+        Parameters:
+        -----------
+        A_flat : np.ndarray
+            Flattened adjacency matrix.
+        X : np.ndarray
+            KPI measurements matrix.
+        A_prev : np.ndarray, optional
+            Previous adjacency matrix for temporal consistency.
+
+        Returns:
+        --------
+        float : Value of the objective function.
+        """
+        n = self.n_kpis
+        # Reshape the flattened array back to a matrix, ensuring zeros on diagonal
+        A = np.zeros((n, n))
+        idx = 0
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    A[i, j] = A_flat[idx]
+                    idx += 1
+
+        # Reconstruction term
+        recon_error = np.linalg.norm(X - A @ X, "fro") ** 2
+
+        # Regularization terms
+        frob_reg = self.alpha * np.linalg.norm(A, "fro") ** 2
+        l1_reg = self.beta * np.sum(np.abs(A))
+
+        # Temporal consistency term
+        temporal_reg = 0
+        if A_prev is not None:
+            temporal_reg = self.gamma * np.linalg.norm(A - A_prev, "fro") ** 2
+
+        return recon_error + frob_reg + l1_reg + temporal_reg
+
+    def _objective_gradient(
+        self, A_flat: np.ndarray, X: np.ndarray, A_prev: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """
+        Gradient of objective function for optimization.
+
+        Parameters:
+        -----------
+        A_flat : np.ndarray
+            Flattened adjacency matrix.
+        X : np.ndarray
+            KPI measurements matrix.
+        A_prev : np.ndarray, optional
+            Previous adjacency matrix for temporal consistency.
+
+        Returns:
+        --------
+        np.ndarray : Gradient of the objective function.
+        """
+        n = self.n_kpis
+        # Reshape the flattened array back to a matrix, ensuring zeros on diagonal
+        A = np.zeros((n, n))
+        idx = 0
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    A[i, j] = A_flat[idx]
+                    idx += 1
+
+        # Gradient of reconstruction term
+        recon_grad = -2 * ((X - A @ X) @ X.T)
+
+        # Gradient of Frobenius norm
+        frob_grad = 2 * self.alpha * A
+
+        # Gradient of L1 norm (subgradient)
+        l1_grad = self.beta * np.sign(A)
+
+        # Gradient of temporal consistency
+        temporal_grad = np.zeros_like(A)
+        if A_prev is not None:
+            temporal_grad = 2 * self.gamma * (A - A_prev)
+
+        # Sum all gradients
+        grad = recon_grad + frob_grad + l1_grad + temporal_grad
+
+        # Flatten gradient, excluding diagonal elements
+        grad_flat = np.zeros(n * (n - 1))
+        idx = 0
+        for i in range(n):
+            for j in range(n):
+                if i != j:
+                    grad_flat[idx] = grad[i, j]
+                    idx += 1
+
+        return grad_flat
+
+    def learn_graph_structure(
+        self, time_windows: Optional[List[Tuple[str, str]]] = None
+    ) -> Dict[str, np.ndarray]:
+        """
+        Learn the graph structure from KPI data for specified time windows.
+
+        Parameters:
+        -----------
+        time_windows : List[Tuple[str, str]], optional
+            List of time window tuples (start_date, end_date). If None, uses the entire data.
+
+        Returns:
+        --------
+        Dict[str, np.ndarray] : Dictionary mapping time window labels to adjacency matrices.
+        """
+        if self.kpi_data is None:
+            raise ValueError("Data must be loaded first.")
+
+        # If no time windows provided, use the entire dataset
+        if time_windows is None:
+            time_windows = [
+                ("all", self.kpi_data.index.min(), self.kpi_data.index.max())
+            ]
+
+        self.adjacency_matrices = {}
+        self.laplacian_matrices = {}
+        self.graph_series = {}
+
+        A_prev = None  # Initial previous adjacency matrix
+
+        for window_label, start_date, end_date in time_windows:
+            # Extract data for the current time window
+            window_data = self.kpi_data.loc[start_date:end_date]
+            X = window_data.values.T  # Transpose to get [n_kpis x n_observations]
+
+            n = self.n_kpis
+            n_flat = n * (n - 1)  # Number of non-diagonal elements
+
+            # Initial guess for optimization (flattened non-diagonal elements)
+            A_init = np.zeros(n_flat)
+
+            # Define constraints to ensure non-negativity
+            constraints = [{"type": "ineq", "fun": lambda x: x}]  # A_ij >= 0
+
+            # Optimize the objective function
+            result = minimize(
+                fun=self._objective_function,
+                x0=A_init,
+                args=(X, A_prev),
+                jac=self._objective_gradient,
+                constraints=constraints,
+                method="SLSQP",
+                options={"maxiter": 200, "disp": True},
+            )
+
+            # Reshape the optimized parameters to get the adjacency matrix
+            A_opt = np.zeros((n, n))
+            idx = 0
+            for i in range(n):
+                for j in range(n):
+                    if i != j:
+                        A_opt[i, j] = max(0, result.x[idx])  # Ensure non-negativity
+                        idx += 1
+
+            # Compute the Laplacian matrix
+            D_opt = np.diag(np.sum(A_opt, axis=1))
+            L_opt = D_opt - A_opt
+
+            # Store the results
+            self.adjacency_matrices[window_label] = A_opt
+            self.laplacian_matrices[window_label] = L_opt
+
+            # Create NetworkX graph
+            G = nx.DiGraph()
+            for i, kpi1 in enumerate(self.kpi_names):
+                G.add_node(kpi1)
+                for j, kpi2 in enumerate(self.kpi_names):
+                    if i != j and A_opt[i, j] > 0:
+                        G.add_edge(kpi1, kpi2, weight=A_opt[i, j])
+
+            self.graph_series[window_label] = G
+
+            # Update previous adjacency matrix for temporal consistency
+            A_prev = A_opt
+
+        print(
+            f"Graph structure learning completed for {len(self.graph_series)} time windows."
+        )
+        return self.adjacency_matrices
+
+    def detect_communities(
+        self, method: str = "walktrap", n_communities: Optional[int] = None
+    ) -> Dict:
+        """
+        Detect communities in KPI networks.
+
+        Parameters:
+        -----------
+        method : str
+            Method for community detection ('walktrap', 'louvain', or 'spectral').
+        n_communities : int, optional
+            Number of communities for spectral clustering. Only used if method='spectral'.
+
+        Returns:
+        --------
+        Dict : Dictionary containing community assignments for each time window.
+        """
+        if not self.graph_series:
+            raise ValueError("Graph structure must be learned first.")
+
+        self.communities = {}
+
+        for window_label, G in self.graph_series.items():
+            if method == "walktrap":
+                # For walktrap, convert to undirected graph with weights
+                G_undir = G.to_undirected()
+                # Use community_louvain as an approximation to walktrap
+                partition = community_louvain.best_partition(G_undir)
+
+            elif method == "louvain":
+                # Convert to undirected graph with weights
+                G_undir = G.to_undirected()
+                partition = community_louvain.best_partition(G_undir)
+
+            elif method == "spectral":
+                if n_communities is None:
+                    raise ValueError(
+                        "n_communities must be specified for spectral clustering."
+                    )
+
+                # Get Laplacian matrix
+                L = self.laplacian_matrices[window_label]
+
+                # Compute eigenvectors corresponding to the smallest eigenvalues
+                # Fixed: Using subset_by_index instead of eigvals
+                eigenvalues, eigenvectors = eigh(
+                    L, subset_by_index=(0, n_communities - 1)
+                )
+
+                # Skip first eigenvector (constant vector)
+                embedding = eigenvectors[:, 1:n_communities]
+
+                # Apply K-means clustering
+                kmeans = KMeans(n_clusters=n_communities, random_state=42)
+                labels = kmeans.fit_predict(embedding)
+
+                # Create partition dictionary
+                partition = {kpi: label for kpi, label in zip(self.kpi_names, labels)}
+
+            else:
+                raise ValueError(f"Unsupported community detection method: {method}")
+
+            self.communities[window_label] = partition
+
+        print(
+            f"Community detection completed for {len(self.communities)} time windows."
+        )
+        return self.communities
+
+    def compute_centrality_measures(self) -> Dict:
+        """
+        Compute various centrality measures for KPIs.
+
+        Returns:
+        --------
+        Dict : Dictionary containing centrality measures for each KPI.
+        """
+        if not self.graph_series:
+            raise ValueError("Graph structure must be learned first.")
+
+        self.centrality_measures = {}
+
+        for window_label, G in self.graph_series.items():
+            # Compute various centrality measures
+            degree_centrality = nx.degree_centrality(G)
+            in_degree_centrality = nx.in_degree_centrality(G)
+            out_degree_centrality = nx.out_degree_centrality(G)
+            eigenvector_centrality = nx.eigenvector_centrality_numpy(G, weight="weight")
+
+            # For betweenness centrality, create undirected graph if needed
             try:
-                self.data.index = pd.DatetimeIndex(self.data.index)
-                self.dates = self.data.index
+                betweenness_centrality = nx.betweenness_centrality(G, weight="weight")
             except:
-                raise ValueError("Dates must be convertible to datetime format")
+                G_undir = G.to_undirected()
+                betweenness_centrality = nx.betweenness_centrality(
+                    G_undir, weight="weight"
+                )
 
-        # Validate seasonal periods
-        if not all(period > 1 for period in self.seasonal_periods):
-            raise ValueError("All seasonal periods must be greater than 1")
+            self.centrality_measures[window_label] = {
+                "degree": degree_centrality,
+                "in_degree": in_degree_centrality,
+                "out_degree": out_degree_centrality,
+                "eigenvector": eigenvector_centrality,
+                "betweenness": betweenness_centrality,
+            }
 
-        # Sort seasonal periods in ascending order for efficient decomposition
-        self.seasonal_periods.sort()
+        print(
+            f"Centrality measures computed for {len(self.centrality_measures)} time windows."
+        )
+        return self.centrality_measures
 
-        if self.trend_window is not None:
-            min_required = 2 * max(self.seasonal_periods) + 1
-            if self.trend_window < min_required:
-                raise ValueError(f"trend_window must be >= {min_required} for given seasonal_periods")
-            if self.trend_window % 2 == 0:
-                self.trend_window += 1  # Ensure odd
-        else:
-            # Calculate trend window as 2x + 1 of max period to ensure it's odd and large enough
-            max_period = max(self.seasonal_periods)
-            self.trend_window = 2 * max_period + 1
-            # Ensure it's at least 11
-            self.trend_window = max(self.trend_window, 11)
-
-    def fit(self, data=None, dates=None, seasonal_periods=None, trend_window=None):
+    def identify_key_influencers(
+        self, centrality_type: str = "eigenvector", top_n: int = 5
+    ) -> Dict[str, List[Tuple[str, float]]]:
         """
-        Fit the MTSN model to the data.
-
-        This method performs the time series decomposition and constructs the graph.
+        Identify key influencer KPIs based on centrality measures.
 
         Parameters:
         -----------
-        data : array-like or pandas.Series, optional
-            The time series data (KPI values)
-        dates : array-like or pandas.DatetimeIndex, optional
-            The corresponding dates for the time series data
-        seasonal_periods : list of int or int, optional
-            The periods of the seasonality components
-        trend_window : int, optional
-            The window length for the trend component in STL decomposition
+        centrality_type : str
+            Type of centrality to use ('degree', 'in_degree', 'out_degree', 'eigenvector', 'betweenness').
+        top_n : int
+            Number of top influencers to return.
 
         Returns:
         --------
-        self : object
-            Returns self.
+        Dict[str, List[Tuple[str, float]]] : Dictionary mapping time windows to lists of (KPI, centrality) tuples.
         """
-        # Update parameters if provided
-        if data is not None:
-            self.data = data
-        if dates is not None:
-            self.dates = dates
-        if seasonal_periods is not None:
-            # Convert single period to list if needed
-            if not isinstance(seasonal_periods, list):
-                self.seasonal_periods = [seasonal_periods]
-            else:
-                self.seasonal_periods = seasonal_periods
-        if trend_window is not None:
-            self.trend_window = trend_window
+        if not self.centrality_measures:
+            self.compute_centrality_measures()
 
-        self._validate_inputs()
+        key_influencers = {}
 
-        # Perform time series decomposition
-        self._decompose_time_series()
+        for window_label, centrality_dict in self.centrality_measures.items():
+            if centrality_type not in centrality_dict:
+                raise ValueError(f"Centrality type {centrality_type} not available.")
 
-        # Construct the MTSN graph
-        self._construct_graph()
+            # Sort KPIs by centrality value
+            sorted_kpis = sorted(
+                centrality_dict[centrality_type].items(),
+                key=lambda x: x[1],
+                reverse=True,
+            )
 
-        return self
+            # Return top_n KPIs
+            key_influencers[window_label] = sorted_kpis[:top_n]
 
-    def _decompose_time_series(self, seasonal_smoothing=None):
+        return key_influencers
+
+    def predict_missing_values(
+        self, data_with_missing: pd.DataFrame, lambda_reg: float = 0.1
+    ) -> pd.DataFrame:
         """
-        Perform time series decomposition using STL.
-        """
-        # Handle missing values if any
-        has_missing = self.data.isnull().any()
-        if has_missing:
-            warnings.warn("Data contains missing values. Interpolating before decomposition.")
-            self.data = self.data.interpolate()
-
-        # Initialize DataFrame to store decomposition
-        self.decomposition = pd.DataFrame({'original': self.data}, index=self.data.index)
-
-        # Initialize storage for individual seasonal components
-        self.seasonal_components = {}
-
-        # Start with the original series
-        remainder = self.data.copy()
-
-        # Apply STL decomposition for each seasonal period
-        for i, period in enumerate(self.seasonal_periods):
-            seasonal_id = f"seasonal_{period}"
-
-            # Set seasonal smoothing
-            if seasonal_smoothing is None:
-                # Default calculation: typically 7 for weekly patterns, larger for longer periods
-                seasonal_smoothing = min(max(7, period), 2 * period + 1)
-                if seasonal_smoothing % 2 == 0:
-                    seasonal_smoothing += 1
-
-            # Ensure trend window is odd and greater than period for each decomposition
-            adjusted_trend = max(period + 2, self.trend_window)
-            if adjusted_trend % 2 == 0:
-                adjusted_trend += 1
-
-            # Apply STL decomposition with the adjusted trend window
-            stl = STL(remainder, period=period, seasonal=seasonal_smoothing, trend=adjusted_trend, robust=True)
-            result = stl.fit()
-
-            # Store this seasonal component
-            self.seasonal_components[seasonal_id] = result.seasonal
-            self.decomposition[seasonal_id] = result.seasonal
-
-            # If this is the last seasonal period, also store the trend and remainder
-            if i == len(self.seasonal_periods) - 1:
-                self.decomposition['trend'] = result.trend
-                self.decomposition['remainder'] = result.resid
-
-            # Update remainder by removing this seasonal component
-            remainder = remainder - result.seasonal
-
-        # Create a combined seasonal component (sum of all individual seasonal components)
-        self.decomposition['seasonal'] = sum(self.seasonal_components.values())
-
-        return self.decomposition
-
-
-    def _construct_graph(self, seasonal_corr_threshold=0.5):
-        """
-        Construct the Multi-Layer Temporal-Seasonal Network graph.
+        Predict missing values in KPI data using graph-based optimization.
 
         Parameters:
         -----------
-        seasonal_corr_threshold : float
-            Threshold for seasonal correlation to add seasonal cycle edges
+        data_with_missing : pd.DataFrame
+            DataFrame containing KPI data with missing values.
+        lambda_reg : float
+            Regularization parameter for graph smoothness.
 
         Returns:
         --------
-        networkx.DiGraph
-            The constructed MTSN graph
+        pd.DataFrame : DataFrame with predicted values for missing entries.
         """
+        if not self.laplacian_matrices:
+            raise ValueError("Graph structure must be learned first.")
 
-        def calculate_seasonal_correlation(seasonal_component, lag):
-            """Calculate auto-correlation of seasonal component at specified lag"""
-            # Extract the seasonal component series
-            s_series = np.array(seasonal_component)
-            n = len(s_series)
+        # Use the most recent Laplacian matrix
+        window_label = list(self.laplacian_matrices.keys())[-1]
+        L = self.laplacian_matrices[window_label]
 
-            if lag >= n:
-                return 0.0
+        # Create a mask of observed values (1 for observed, 0 for missing)
+        mask = ~data_with_missing.isna()
+        mask_values = mask.values
 
-            # Calculate mean
-            mean = np.mean(s_series)
+        # Initialize with mean imputation
+        X_init = data_with_missing.copy()
+        for col in X_init.columns:
+            X_init[col].fillna(X_init[col].mean(), inplace=True)
 
-            # Calculate numerator (covariance)
-            numerator = 0
-            for i in range(n - lag):
-                numerator += (s_series[i] - mean) * (s_series[i + lag] - mean)
+        X_values = X_init.values
 
-            # Calculate denominator (variance)
-            denominator = np.sum((s_series - mean) ** 2)
+        # Define the objective function for missing value optimization
+        def obj_func(x_flat):
+            # Reshape the flattened array
+            X_pred = X_values.copy()
+            X_pred[~mask_values] = x_flat
 
-            # Return autocorrelation
-            if denominator == 0:
-                return 0.0
-            return numerator / denominator
+            # Reconstruction error term (only for observed values)
+            recon_error = np.sum((mask_values * (X_values - X_pred)) ** 2)
 
-        # Initialize directed graph
-        self.graph = nx.DiGraph()
+            # Graph smoothness term
+            smoothness = lambda_reg * np.trace(X_pred.T @ L @ X_pred)
 
-        # Add time nodes and component nodes
-        for i, date in enumerate(self.decomposition.index):
-            # Create time node
-            time_node_id = f"t_{i}"
-            self.graph.add_node(time_node_id, type='time', date=date, index=i, value=self.decomposition.iloc[i]['original'])
+            return recon_error + smoothness
 
-            # Create component nodes
-            trend_node_id = f"T_{i}"
-            remainder_node_id = f"R_{i}"
+        # Get initial values for missing entries
+        x0 = X_values[~mask_values]
 
-            self.graph.add_node(trend_node_id, type='trend', date=date, index=i, value=self.decomposition.iloc[i]['trend'])
-            self.graph.add_node(remainder_node_id, type='remainder', date=date, index=i, value=self.decomposition.iloc[i]['remainder'])
+        # Optimize
+        result = minimize(
+            fun=obj_func, x0=x0, method="L-BFGS-B", options={"maxiter": 100}
+        )
 
-            # Add combined seasonal node
-            seasonal_node_id = f"S_{i}"
-            self.graph.add_node(seasonal_node_id, type='seasonal', date=date, index=i, value=self.decomposition.iloc[i]['seasonal'])
+        # Update the missing values with optimized values
+        X_pred = X_values.copy()
+        X_pred[~mask_values] = result.x
 
-            # Add individual seasonal component nodes
-            for period in self.seasonal_periods:
-                seasonal_id = f"seasonal_{period}"
-                seasonal_comp_node_id = f"S{period}_{i}"
+        # Return as DataFrame
+        predicted_df = pd.DataFrame(
+            X_pred, index=data_with_missing.index, columns=data_with_missing.columns
+        )
 
-                self.graph.add_node(seasonal_comp_node_id, type='seasonal_component', period=period, date=date, index=i, value=self.decomposition.iloc[i][seasonal_id])
+        print(f"Missing value prediction completed.")
+        return predicted_df
 
-                # Add edge from combined seasonal node to this component
-                self.graph.add_edge(seasonal_node_id, seasonal_comp_node_id, weight=1.0, type='seasonal_decomposition')
-
-            # Add decomposition edges (from time node to primary component nodes)
-            self.graph.add_edge(time_node_id, trend_node_id, weight=1.0, type='decomposition')
-            self.graph.add_edge(time_node_id, seasonal_node_id, weight=1.0, type='decomposition')
-            self.graph.add_edge(time_node_id, remainder_node_id, weight=1.0, type='decomposition')
-
-            # Add temporal progression edges (between consecutive time nodes)
-            if i < len(self.decomposition) - 1:
-                next_time_node_id = f"t_{i + 1}"
-                time_diff = (self.decomposition.index[i + 1] - date).total_seconds() / (24 * 3600)  # in days
-                self.graph.add_edge(time_node_id, next_time_node_id, weight=time_diff, type='temporal_progression')
-
-        # Add seasonal cycle edges for each seasonal period
-        for period in self.seasonal_periods:
-            seasonal_id = f"seasonal_{period}"
-            seasonal_array = np.array(self.seasonal_components[seasonal_id])
-
-            for i in range(len(self.decomposition) - period):
-                seasonal_comp_node_id = f"S{period}_{i}"
-                seasonal_cycle_node_id = f"S{period}_{i + period}"
-
-                seasonal_corr = calculate_seasonal_correlation(seasonal_array, period)
-
-                # Add edge if correlation is significant
-                if  seasonal_corr > seasonal_corr_threshold:
-                    self.graph.add_edge(seasonal_comp_node_id, seasonal_cycle_node_id, weight=seasonal_corr, type='seasonal_cycle', period=period)
-
-        # Add pattern nodes for each identified seasonal pattern
-        for period in self.seasonal_periods:
-            pattern_node_id = f"P_{period}"
-            self.graph.add_node(pattern_node_id, type='pattern', period=period)
-
-            # Connect pattern node to corresponding seasonal component nodes
-            for i in range(self.decomposition.shape[0]):
-                seasonal_comp_node_id = f"S{period}_{i}"
-                phase = i % period
-                seasonal_id = f"seasonal_{period}"
-                amplitude = np.std(self.decomposition[seasonal_id])
-
-                # Weight based on phase of seasonal pattern
-                weight = amplitude * (np.sin(2 * np.pi * phase / period) + 1) / 2  # Scaled to [0,1]
-
-                self.graph.add_edge(pattern_node_id, seasonal_comp_node_id, weight=weight, phase=phase, type='pattern_recognition', period=period)
-
-        # Add interval nodes for common time periods (e.g., quarters, months)
-        self._add_interval_nodes()
-
-        return self.graph
-
-    def _add_interval_nodes(self, interval_types=None):
+    def run_full_analysis(
+        self,
+        periods: List[int] = [12],
+        n_communities: int = 3,
+        centrality_type: str = "eigenvector",
+    ) -> Dict:
         """
-        Add interval nodes for relevant time periods.
+        Run the complete KPI network analysis pipeline.
 
         Parameters:
         -----------
-        interval_types : list of str
-            List of interval types to add (e.g., 'quarterly', 'monthly', 'weekly')
-        """
-        if interval_types is None:
-            interval_types = ['quarterly']  # Default to quarterly for backward compatibility
-
-        dates = [v for k, v in nx.get_node_attributes(self.graph,'date').items() if 't_' in k]
-        min_time = min(sorted(dates))
-        max_time = max(sorted(dates))
-
-        intervals = []
-        if 'daily' in interval_types:
-            current = min_time.replace(hour=0, minute=0, second=0, microsecond=0)
-            while current <= max_time:
-                interval_end = current + timedelta(days=1) - timedelta(microseconds=1)
-                intervals.append((current, min(interval_end, max_time), 'daily'))
-                current += timedelta(days=1)
-        if 'weekly' in interval_types:
-            current = min_time - timedelta(days=min_time.weekday())
-            current = current.replace(hour=0, minute=0, second=0, microsecond=0)
-            while current <= max_time:
-                interval_end = current + timedelta(days=6, hours=23, minutes=59, seconds=59)
-                intervals.append((current, min(interval_end, max_time), 'weekly'))
-                current += timedelta(weeks=1)
-        if 'monthly' in interval_types:
-            current = min_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
-            while current <= max_time:
-                next_month = current.month % 12 + 1
-                next_year = current.year + (current.month // 12)
-                interval_end = datetime(next_year, next_month, 1) - timedelta(microseconds=1)
-                if interval_end > max_time:
-                    interval_end = max_time
-                intervals.append((current, interval_end, 'monthly'))
-                current = datetime(next_year, next_month, 1)
-        if 'quarterly' in interval_types:
-            current_year = min_time.year
-            current_quarter = (min_time.month - 1) // 3
-            current = datetime(current_year, current_quarter * 3 + 1, 1)
-            current = current.replace(hour=0, minute=0, second=0, microsecond=0)
-            while current <= max_time:
-                next_quarter = current_quarter + 1
-                if next_quarter > 3:
-                    next_year = current_year + 1
-                    next_quarter = 0
-                else:
-                    next_year = current_year
-                interval_end = datetime(next_year if next_quarter == 0 else current_year, next_quarter * 3 + 1 if next_quarter < 3 else 1,1) - timedelta(microseconds=1)
-                if interval_end > max_time:
-                    interval_end = max_time
-                intervals.append((current, interval_end, 'quarterly'))
-                current_quarter = next_quarter
-                current_year = next_year if next_quarter == 0 else current_year
-                current = datetime(current_year, next_quarter * 3 + 1, 1)
-        if 'yearly' in interval_types:
-            current = datetime(min_time.year, 1, 1)
-            current = current.replace(hour=0, minute=0, second=0, microsecond=0)
-            while current <= max_time:
-                interval_end = datetime(current.year + 1, 1, 1) - timedelta(microseconds=1)
-                if interval_end > max_time:
-                    interval_end = max_time
-                intervals.append((current, interval_end, 'yearly'))
-                current = datetime(current.year + 1, 1, 1)
-
-        # Add interval nodes and edges
-        for start_time, end_time, interval in intervals:
-            time_points = [d for d in [v for k, v in nx.get_node_attributes(self.graph,'date').items() if 't_' in k] if start_time <= d <= end_time]
-            time_points.sort()
-
-            if len(time_points) < 2:
-                return
-
-            interval_node_id = f"I_{start_time}_{end_time}"
-            self.graph.add_node(interval_node_id, type='interval', start=start_time, end=end_time, interval=interval)
-
-            for i in range(len(time_points)):
-                time_node_id = f"T_{time_points[i]}"
-
-                # Calculate true trapezoidal weight
-                if i == 0 or i == len(time_points) - 1:
-                    # For end points, consider time interval to next/previous point
-                    dt = 0
-                    if i == 0 and len(time_points) > 1:
-                        dt = time_points[1] - time_points[0]
-                    elif i == len(time_points) - 1 and len(time_points) > 1:
-                        dt = time_points[i] - time_points[i - 1]
-                    weight = 0.5 * dt
-                else:
-                    # For interior points, use distance to adjacent points
-                    dt_left = time_points[i] - time_points[i - 1]
-                    dt_right = time_points[i + 1] - time_points[i]
-                    weight = 0.5 * (dt_left + dt_right)
-
-                self.graph.add_edge(interval_node_id, time_node_id, weight=weight, type='temporal_integration')
-
-    def temporal_integration(self, component='trend', start_date=None, end_date=None):
-        """
-        Perform temporal integration of a component over a specified time interval.
-
-        Parameters:
-        -----------
-        component : str
-            The component to integrate ('original', 'trend', 'seasonal', 'remainder',
-            or 'seasonal_{period}' for a specific seasonal component)
-        start_date : datetime or str, optional
-            The start date of the integration period
-        end_date : datetime or str, optional
-            The end date of the integration period
+        periods : List[int]
+            List of seasonal periods for multi-seasonal time series decomposition.
+        n_communities : int
+            Number of communities to detect.
+        centrality_type : str
+            Type of centrality to use for key influencer identification.
 
         Returns:
         --------
-        float
-            The integrated value
+        Dict : Summary of analysis results.
         """
-        if self.decomposition is None:
-            raise ValueError("The model must be fitted first using the fit() method")
+        if self.kpi_data is None:
+            raise ValueError("Data must be loaded first.")
 
-        # Validate component
-        if component not in self.decomposition.columns:
-            raise ValueError(
-                f"Component '{component}' not found. Available components: {list(self.decomposition.columns)}")
+        print("Starting full KPI network analysis...")
 
-        # Convert string dates to datetime if necessary
-        if isinstance(start_date, str):
-            start_date = pd.to_datetime(start_date)
-        if isinstance(end_date, str):
-            end_date = pd.to_datetime(end_date)
+        # Step 1: Time series decomposition
+        print("Step 1: Performing multi-seasonal time series decomposition...")
+        self.decompose_time_series(periods=periods)
 
-        # If no dates specified, use full range
-        if start_date is None:
-            start_date = self.decomposition.index.min()
-        if end_date is None:
-            end_date = self.decomposition.index.max()
+        # Step 2: Learn graph structure
+        print("Step 2: Learning graph structure...")
+        self.learn_graph_structure()
 
-        # Filter data for the specified period
-        mask = (self.decomposition.index >= start_date) & (self.decomposition.index <= end_date)
-        period_data = self.decomposition.loc[mask]
+        # Step 3: Detect communities
+        print("Step 3: Detecting communities...")
+        self.detect_communities(method="spectral", n_communities=n_communities)
 
-        if len(period_data) == 0:
-            raise ValueError(f"No data found in the specified time range: {start_date} to {end_date}")
+        # Step 4: Compute centrality measures
+        print("Step 4: Computing centrality measures...")
+        self.compute_centrality_measures()
 
-        # Convert dates to numeric (days since start) for trapezoidal integration
-        days = [(date - period_data.index[0]).total_seconds() / (24 * 3600) for date in period_data.index]
-        values = period_data[component].values
+        # Step 5: Identify key influencers
+        print("Step 5: Identifying key influencers...")
+        key_influencers = self.identify_key_influencers(centrality_type=centrality_type)
 
-        # Apply trapezoidal rule for integration
-        integrated_value = np.trapz(values, days)
+        # Prepare summary of results
+        results_summary = {
+            "n_kpis": self.n_kpis,
+            "time_periods": len(self.kpi_data),
+            "periods_analyzed": periods,
+            "communities": self.communities,
+            "key_influencers": key_influencers,
+        }
 
-        return integrated_value
-
-    def detect_hotspots(self, threshold=2.0, component='remainder'):
-        """
-        Detect hotspots in the KPI using graph centrality measures.
-
-        Parameters:
-        -----------
-        threshold : float
-            Z-score threshold for hotspot detection
-        component : str
-            The component to analyze for hotspots ('remainder' by default,
-            can also be 'original', 'seasonal', or a specific seasonal component)
-
-        Returns:
-        --------
-        pandas.DataFrame
-            Detected hotspots with their characteristics
-        """
-        if self.graph is None:
-            raise ValueError("The model must be fitted first using the fit() method")
-
-        # Determine node type based on component
-        if component == 'remainder':
-            node_type = 'remainder'
-        elif component == 'original':
-            node_type = 'time'
-        elif component == 'trend':
-            node_type = 'trend'
-        elif component == 'seasonal':
-            node_type = 'seasonal'
-        elif component.startswith('seasonal_'):
-            period = int(component.split('_')[1])
-            # Filter nodes by both type and period
-            target_nodes = [n for n, attr in self.graph.nodes(data=True) if attr.get('type') == 'seasonal_component' and attr.get('period') == period]
-        else:
-            raise ValueError(f"Invalid component '{component}' for hotspot detection")
-
-        # Get the target nodes
-        if not component.startswith('seasonal_'):
-            target_nodes = [n for n, attr in self.graph.nodes(data=True) if attr.get('type') == node_type]
-
-        # Initialize subgraph for centrality calculation
-        subgraph = nx.DiGraph()
-
-        # Add nodes to subgraph
-        for node in target_nodes:
-            subgraph.add_node(node, **self.graph.nodes[node])
-
-        # Add edges between consecutive nodes
-        for i in range(len(target_nodes) - 1):
-            node1 = target_nodes[i]
-            node2 = target_nodes[i + 1]
-
-            val1 = self.graph.nodes[node1]['value']
-            val2 = self.graph.nodes[node2]['value']
-
-            # Weight inversely proportional to value difference
-            weight = 1.0 / (abs(val1 - val2) + 1e-10)
-
-            subgraph.add_edge(node1, node2, weight=weight)
-
-        # Calculate betweenness centrality
-        centrality = nx.betweenness_centrality(subgraph, weight='weight', normalized=True)
-
-        # Extract values and calculate z-scores
-        values = [self.graph.nodes[n]['value'] for n in target_nodes]
-        value_zscores = zscore(values)
-        centrality_zscores = zscore(list(centrality.values()))
-
-        # Identify hotspots
-        hotspots = []
-
-        for i, node in enumerate(target_nodes):
-            idx = self.graph.nodes[node]['index']
-            date = self.graph.nodes[node]['date']
-            value = values[i]
-            value_zscore = value_zscores[i]
-            centrality_zscore = centrality_zscores[i]
-
-            # Hotspot if either value or centrality exceeds threshold
-            if abs(value_zscore) > threshold or abs(centrality_zscore) > threshold:
-                severity = max(abs(value_zscore), abs(centrality_zscore))
-
-                hotspot_data = {
-                    'index': idx,
-                    'date': date,
-                    'component': component,
-                    'value': value,
-                    'value_zscore': value_zscore,
-                    'centrality': centrality[node],
-                    'centrality_zscore': centrality_zscore,
-                    'severity': severity
-                }
-
-                # Add period information for seasonal components
-                if component.startswith('seasonal_'):
-                    hotspot_data['period'] = period
-
-                hotspots.append(hotspot_data)
-
-        # Convert to DataFrame and sort by severity
-        if hotspots:
-            columns = ['index', 'date', 'component', 'value', 'value_zscore', 'centrality', 'centrality_zscore', 'severity']
-            if component.startswith('seasonal_'):
-                columns.append('period')
-            self.hotspots = pd.DataFrame(hotspots, columns=columns).sort_values('severity', ascending=False)
-        else:
-            columns = ['index', 'date', 'component', 'value', 'value_zscore', 'centrality', 'centrality_zscore', 'severity']
-            if component.startswith('seasonal_'):
-                columns.append('period')
-            self.hotspots = pd.DataFrame(columns=columns)
-
-        return self.hotspots
-
-    def get_seasonal_components(self):
-        """
-        Get all seasonal components.
-
-        Returns:
-        --------
-        dict
-            Dictionary of seasonal components with keys 'seasonal_{period}'
-        """
-        if self.seasonal_components is None:
-            raise ValueError("The model must be fitted first using the fit() method")
-
-        return self.seasonal_components
+        print("KPI network analysis completed successfully.")
+        return results_summary
