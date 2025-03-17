@@ -1,427 +1,591 @@
 import warnings
+from datetime import timedelta, datetime
 
-import networkx as nx
 import numpy as np
 import pandas as pd
-from scipy.integrate import trapezoid
+import networkx as nx
+
+from statsmodels.tsa.seasonal import STL
 from scipy.stats import zscore
 
-from stl import STLTemporalIntegration
-
-warnings.filterwarnings("ignore")
 
 class MTSN:
     """
-    Multi-Layer Temporal-Seasonal Network (MTSN) for KPI analysis with hotspot detection.
+    Multi-Layer Temporal-Seasonal Network (MTSN) for KPI Analysis.
+
+    This class implements the MTSN framework as described in the paper:
+    "Multi-Layer Temporal-Seasonal Network for KPI Analysis" by P. Witlox.
     """
 
-    def __init__(self, data=None, date_column=None, value_column=None, period=None, hotspot_threshold=2.5, autocorr_threshold=0.3):
+    def __init__(self, data=None, dates=None, seasonal_periods=None, trend_window=None):
         """
         Initialize the MTSN framework.
 
         Parameters:
         -----------
-        data : pandas DataFrame
-            DataFrame containing time series data
-        date_column : str
-            Name of the column containing datetime values
-        value_column : str
-            Name of the column containing KPI values
-        period : int
-            The seasonal period (e.g., 7 for weekly, 12 for monthly)
-        hotspot_threshold : float
-            Z-score threshold for hotspot detection
-        autocorr_threshold : float
-            Threshold for significant seasonal autocorrelation
+        data : array-like or pandas.Series
+            The time series data (KPI values)
+        dates : array-like or pandas.DatetimeIndex
+            The corresponding dates for the time series data
+        seasonal_periods : list of int or int
+            The periods of the seasonality components (e.g., [7, 30, 365] for weekly, monthly, and yearly)
+            If a single integer is provided, it will be converted to a list with one element
+        trend_window : int
+            The window length for the trend component in STL decomposition
         """
-        self.df = None
-        self.date_col = date_column
-        self.value_col = value_column
-        self.period = period
-        self.hotspot_threshold = hotspot_threshold
-        self.autocorr_threshold = autocorr_threshold
+        self.data = data
+        self.dates = dates
+        if seasonal_periods is not None and not isinstance(seasonal_periods, list):
+            self.seasonal_periods = [seasonal_periods]
+        else:
+            self.seasonal_periods = seasonal_periods
 
-        # Graph components
-        self.graph = None
+        self.trend_window = trend_window
+
+        # Initialize components
         self.decomposition = None
-
-        # Component series
-        self.trend = None
-        self.seasonal = None
-        self.remainder = None
-
-        # Hotspot information
+        self.graph = None
         self.hotspots = None
 
-        # Comparison results
-        self.comparison_results = None
-        self.hotspot_evaluation = None
-        self.integration_comparison = None
+        if data is not None and dates is not None and seasonal_periods is not None:
+            self._validate_inputs()
 
-        # If data is provided, load it
-        if data is not None and date_column is not None and value_column is not None:
-            self.load_data(data, date_column, value_column)
-
-    def load_data(self, data, date_column, value_column):
-        """
-        Load time series data into the MTSN framework.
-
-        Parameters:
-        -----------
-        data : pandas DataFrame
-            DataFrame containing time series data
-        date_column : str
-            Name of the column containing datetime values
-        value_column : str
-            Name of the column containing KPI values
-        """
-        self.df = data.copy()
-        self.date_col = date_column
-        self.value_col = value_column
-
-        # Ensure date column is datetime type
-        self.df[self.date_col] = pd.to_datetime(self.df[self.date_col])
-
-        # Sort by date
-        self.df = self.df.sort_values(by=self.date_col).reset_index(drop=True)
-
-        # Set date as index
-        self.df.set_index(self.date_col, inplace=True)
-
-        # Infer frequency if period is not provided
-        if self.period is None:
-            # Try to infer frequency from data
-            freq = pd.infer_freq(self.df.index)
-            if freq == 'D':
-                self.period = 7  # Daily data, weekly seasonality
-            elif freq == 'B':
-                self.period = 5  # Business days, weekly seasonality
-            elif freq in ['M', 'MS']:
-                self.period = 12  # Monthly data, annual seasonality
-            elif freq in ['Q', 'QS']:
-                self.period = 4  # Quarterly data, annual seasonality
+    def _validate_inputs(self):
+        """Validate input data and parameters."""
+        # Convert to pandas Series if needed
+        if not isinstance(self.data, pd.Series):
+            if self.dates is not None:
+                self.data = pd.Series(self.data, index=self.dates)
             else:
-                self.period = 7  # Default to weekly
-                print(f"Warning: Could not infer seasonality period from frequency. Defaulting to 7.")
+                self.data = pd.Series(self.data)
 
-        print(f"Loaded {len(self.df)} observations with seasonal period {self.period}")
-        return self
+        # Ensure dates are in datetime format
+        if not isinstance(self.data.index, pd.DatetimeIndex):
+            try:
+                self.data.index = pd.DatetimeIndex(self.data.index)
+                self.dates = self.data.index
+            except:
+                raise ValueError("Dates must be convertible to datetime format")
 
-    def decompose(self, seasonal_deg=1, trend_deg=1, low_pass_deg=1, robust=False):
+        # Validate seasonal periods
+        if not all(period > 1 for period in self.seasonal_periods):
+            raise ValueError("All seasonal periods must be greater than 1")
+
+        # Sort seasonal periods in ascending order for efficient decomposition
+        self.seasonal_periods.sort()
+
+        if self.trend_window is not None:
+            min_required = 2 * max(self.seasonal_periods) + 1
+            if self.trend_window < min_required:
+                raise ValueError(f"trend_window must be >= {min_required} for given seasonal_periods")
+            if self.trend_window % 2 == 0:
+                self.trend_window += 1  # Ensure odd
+        else:
+            # Calculate trend window as 2x + 1 of max period to ensure it's odd and large enough
+            max_period = max(self.seasonal_periods)
+            self.trend_window = 2 * max_period + 1
+            # Ensure it's at least 11
+            self.trend_window = max(self.trend_window, 11)
+
+    def fit(self, data=None, dates=None, seasonal_periods=None, trend_window=None):
         """
-        Perform STL decomposition on the time series data.
+        Fit the MTSN model to the data.
+
+        This method performs the time series decomposition and constructs the graph.
 
         Parameters:
         -----------
-        seasonal_deg : int
-            Degree of seasonal LOESS
-        trend_deg : int
-            Degree of trend LOESS
-        low_pass_deg : int
-            Degree of low-pass LOESS
-        robust : bool
-            Whether to use robust fitting
-        """
-        if self.df is None:
-            raise ValueError("No data loaded. Call load_data() first.")
-
-        # Handle missing values if any
-        if self.df[self.value_col].isnull().any():
-            print("Warning: Missing values detected. Interpolating...")
-            self.df[self.value_col] = self.df[self.value_col].interpolate(method='linear')
-
-        print(f"loading date from {self.date_col} and value from {self.value_col} from dataframe with headers {self.df.columns}")
-
-        # Perform STL decomposition
-        stl = STLTemporalIntegration(self.df, self.date_col, self.value_col)
-        stl.decompose(
-                  seasonal_deg=seasonal_deg,
-                  trend_deg=trend_deg,
-                  low_pass_deg=low_pass_deg,
-                  robust=robust)
-
-        self.decomposition = stl.decomposition
-        # Reset index to get date as a column
-        self.decomposition.reset_index()
-        print(f"Decomposition completed.")
-
-
-    def construct_graph(self):
-        """
-        Construct the Multi-Layer Temporal-Seasonal Network from decomposed data.
-        """
-        if self.decomposition is None:
-            raise ValueError("Decomposition has not been performed. Call decompose() first.")
-
-        self.trend = self.decomposition['trend'].values
-        self.seasonal = self.decomposition['seasonal'].values
-        self.remainder = self.decomposition['remainder'].values
-
-        # Initialize a directed graph
-        graph = nx.DiGraph()
-
-        # Add time point nodes
-        for i, (date, row) in enumerate(self.decomposition.iterrows()):
-            # Add time point node
-            time_node = f"t_{i}"
-            graph.add_node(time_node, type='time', date=date, value=row['original'])
-
-            # Add component nodes
-            trend_node = f"T_{i}"
-            seasonal_node = f"S_{i}"
-            remainder_node = f"R_{i}"
-
-            graph.add_node(trend_node, type='trend', value=row['trend'])
-            graph.add_node(seasonal_node, type='seasonal', value=row['seasonal'])
-            graph.add_node(remainder_node, type='remainder', value=row['remainder'])
-
-            # Add decomposition edges
-            graph.add_edge(time_node, trend_node, weight=1, type='decomposition')
-            graph.add_edge(time_node, seasonal_node, weight=1, type='decomposition')
-            graph.add_edge(time_node, remainder_node, weight=1, type='decomposition')
-
-            # Add temporal progression edge (except for the last point)
-            if i < self.decomposition.shape[0] - 1:
-                next_date = self.decomposition.iloc[i+1].name
-                delta_t = (next_date - date).total_seconds() / (24*3600)  # in days
-                graph.add_edge(f"t_{i}", f"t_{i+1}", weight=delta_t, type='temporal')
-
-        # Add seasonal cycle edges
-        for i in range(self.decomposition.shape[0] - self.period):
-            # Calculate seasonal autocorrelation
-            seasonal_values = self.decomposition['seasonal'].values
-            if i + self.period < len(seasonal_values):
-                # Get windows around the current position and the position one period later
-                subset1 = seasonal_values[max(0, i-self.period//2):min(len(seasonal_values), i+self.period//2)]
-                subset2 = seasonal_values[max(0, i+self.period-self.period//2):min(len(seasonal_values), i+self.period+self.period//2)]
-
-                # Ensure both arrays have the same length
-                min_length = min(len(subset1), len(subset2))
-
-                if min_length > 1:
-                    # Calculate correlation using equally sized arrays
-                    corr = np.corrcoef(subset1[:min_length], subset2[:min_length])[0, 1]
-
-                    # Add edge if correlation is significant
-                    if not np.isnan(corr) and abs(corr) > self.autocorr_threshold:
-                        graph.add_edge(f"S_{i}", f"S_{i+self.period}", weight=abs(corr), type='seasonal_cycle')
-
-        # Add pattern node for the primary seasonal pattern
-        pattern_node = f"P_{self.period}"
-        graph.add_node(pattern_node, type='pattern', period=self.period)
-
-        # Connect pattern node to seasonal components
-        for i in range(self.decomposition.shape[0]):
-            phase = i % self.period
-            amplitude = np.std(self.decomposition['seasonal'])
-            weight = amplitude * np.sin(2 * np.pi * phase / self.period)
-            graph.add_edge(pattern_node, f"S_{i}", weight=abs(weight), type='pattern')
-
-        # Add interval nodes for quarters
-        dates = self.decomposition.index
-        min_date, max_date = dates.min(), dates.max()
-
-        # Create quarterly intervals
-        current = pd.Timestamp(min_date.year, min_date.month, 1)
-        quarter_end_dates = pd.date_range(start=current, end=max_date, freq='Q')
-
-        for q_idx, quarter_end_date in enumerate(quarter_end_dates):
-            if q_idx == 0:
-                quarter_start = min_date
-            else:
-                quarter_start = quarter_end_dates[q_idx-1] + pd.Timedelta(days=1)
-
-            if quarter_end_date > max_date:
-                quarter_end_date = max_date
-
-            # Create interval node
-            interval_name = f"I_{quarter_start.strftime('%Y-%m-%d')}_{quarter_end_date.strftime('%Y-%m-%d')}"
-            graph.add_node(interval_name, type='interval', start_date=quarter_start, end_date=quarter_end_date)
-
-            # Connect to all encompassed time points with integration weights
-            for i, date in enumerate(dates):
-                if quarter_start <= date <= quarter_end_date:
-                    # Use trapezoidal weighting
-                    if date == quarter_start or date == quarter_end_date:
-                        weight = 0.5
-                    else:
-                        weight = 1.0
-
-                    # Get time delta in days
-                    if i < len(dates) - 1:
-                        next_date = dates[i+1]
-                        delta_t = (next_date - date).total_seconds() / (24*3600)
-                    else:
-                        # For the last point, use the previous delta
-                        prev_date = dates[i-1]
-                        delta_t = (date - prev_date).total_seconds() / (24*3600)
-
-                    graph.add_edge(interval_name, f"t_{i}", weight=weight * delta_t, type='integration')
-
-        self.graph = graph
-        print(f"Graph constructed with {len(graph.nodes)} nodes and {len(graph.edges)} edges.")
-
-    def detect_hotspots(self):
-        """
-        Detect hotspots in the KPI data based on remainder component centrality.
-        """
-        if self.graph is None:
-            raise ValueError("Graph has not been constructed. Call construct_graph() first.")
-
-        # Create a subgraph of remainder nodes and their connections
-        remainder_nodes = [n for n, attr in self.graph.nodes(data=True) if attr.get('type') == 'remainder']
-
-        # Create a separate graph for centrality calculation
-        centrality_graph = nx.Graph()
-
-        # Add remainder nodes
-        for node in remainder_nodes:
-            centrality_graph.add_node(node, value=self.graph.nodes[node]['value'])
-
-        # Connect remainder nodes that are adjacent in time
-        for i in range(len(remainder_nodes) - 1):
-            node1 = remainder_nodes[i]
-            node2 = remainder_nodes[i + 1]
-
-            # Calculate weight based on similarity (inverse of absolute difference)
-            val1 = self.graph.nodes[node1]['value']
-            val2 = self.graph.nodes[node2]['value']
-
-            # Add small constant to avoid division by zero
-            weight = 1.0 / (abs(val1 - val2) + 0.0001)
-
-            centrality_graph.add_edge(node1, node2, weight=weight)
-
-        # Calculate betweenness centrality
-        centrality = nx.betweenness_centrality(centrality_graph, weight='weight')
-
-        # Calculate z-scores of remainder values
-        remainder_values = np.array([self.graph.nodes[n]['value'] for n in remainder_nodes])
-        remainder_zscore = zscore(remainder_values)
-
-        # Calculate z-scores of centrality values
-        centrality_values = np.array([centrality[n] for n in remainder_nodes])
-        centrality_zscore = zscore(centrality_values)
-
-        # Identify hotspots where both remainder and centrality z-scores exceed threshold
-        hotspots = []
-        for i, node in enumerate(remainder_nodes):
-            node_idx = int(node.split('_')[1])  # Extract index from node name
-
-            if abs(remainder_zscore[i]) > self.hotspot_threshold or abs(centrality_zscore[i]) > self.hotspot_threshold:
-                hotspots.append({
-                    'index': node_idx,
-                    'date': self.decomposition.index[i],
-                    'remainder_value': remainder_values[i],
-                    'remainder_zscore': remainder_zscore[i],
-                    'centrality': centrality_values[i],
-                    'centrality_zscore': centrality_zscore[i],
-                    'severity': max(abs(remainder_zscore[i]), abs(centrality_zscore[i]))
-                })
-
-        # Sort hotspots by severity
-        self.hotspots = sorted(hotspots, key=lambda x: x['severity'], reverse=True)
-
-        print(f"Detected {len(self.hotspots)} hotspots.")
-
-    def calculate_temporal_integration(self, start_date=None, end_date=None, component='trend'):
-        """
-        Calculate the temporal integration of a component over a specified interval.
-
-        Parameters:
-        -----------
-        start_date : datetime
-            Start date for integration
-        end_date : datetime
-            End date for integration
-        component : str
-            Component to integrate ('trend', 'original', 'seasonal', 'remainder')
+        data : array-like or pandas.Series, optional
+            The time series data (KPI values)
+        dates : array-like or pandas.DatetimeIndex, optional
+            The corresponding dates for the time series data
+        seasonal_periods : list of int or int, optional
+            The periods of the seasonality components
+        trend_window : int, optional
+            The window length for the trend component in STL decomposition
 
         Returns:
         --------
-        float
-            The value of the temporal integration
+        self : object
+            Returns self.
         """
-        if self.decomposition is None:
-            raise ValueError("Decomposition has not been performed. Call decompose() first.")
+        # Update parameters if provided
+        if data is not None:
+            self.data = data
+        if dates is not None:
+            self.dates = dates
+        if seasonal_periods is not None:
+            # Convert single period to list if needed
+            if not isinstance(seasonal_periods, list):
+                self.seasonal_periods = [seasonal_periods]
+            else:
+                self.seasonal_periods = seasonal_periods
+        if trend_window is not None:
+            self.trend_window = trend_window
 
-        # Default to full range if dates not provided
-        if start_date is None:
-            start_date = self.decomposition[self.date_col].min()
-        if end_date is None:
-            end_date = self.decomposition[self.date_col].max()
+        self._validate_inputs()
 
-        # Convert to pandas datetime if not already
-        start_date = pd.to_datetime(start_date)
-        end_date = pd.to_datetime(end_date)
+        # Perform time series decomposition
+        self._decompose_time_series()
 
-        # Filter by date range
-        if self.decomposition.index.name == self.date_col:
-            mask = (self.decomposition.index >= start_date) & (self.decomposition.index <= end_date)
-        else:
-            mask = (self.decomposition[self.date_col] >= start_date) & (self.decomposition[self.date_col] <= end_date)
-        subset = self.decomposition[mask]
+        # Construct the MTSN graph
+        self._construct_graph()
 
-        if len(subset) == 0:
-            raise ValueError(f"No data found between {start_date} and {end_date}")
+        return self
 
-        # Get time deltas in days
-        if self.decomposition.index.name == self.date_col:
-            time_deltas = [(t - subset.index[0]).total_seconds() / (24 * 3600) for t in subset.index]
-        else:
-            time_deltas = [(t - subset[self.date_col].iloc[0]).total_seconds() / (24*3600) for t in subset[self.date_col]]
-
-        # Perform trapezoidal integration
-        return trapezoid(subset[component], time_deltas)
-
-    def get_subgraph_for_interval(self, start_date, end_date):
+    def _decompose_time_series(self, seasonal_smoothing=None):
         """
-        Extract a subgraph corresponding to a specific time interval.
+        Perform time series decomposition using STL.
+        """
+        # Handle missing values if any
+        has_missing = self.data.isnull().any()
+        if has_missing:
+            warnings.warn("Data contains missing values. Interpolating before decomposition.")
+            self.data = self.data.interpolate()
+
+        # Initialize DataFrame to store decomposition
+        self.decomposition = pd.DataFrame({'original': self.data}, index=self.data.index)
+
+        # Initialize storage for individual seasonal components
+        self.seasonal_components = {}
+
+        # Start with the original series
+        remainder = self.data.copy()
+
+        # Apply STL decomposition for each seasonal period
+        for i, period in enumerate(self.seasonal_periods):
+            seasonal_id = f"seasonal_{period}"
+
+            # Set seasonal smoothing
+            if seasonal_smoothing is None:
+                # Default calculation: typically 7 for weekly patterns, larger for longer periods
+                seasonal_smoothing = min(max(7, period), 2 * period + 1)
+                if seasonal_smoothing % 2 == 0:
+                    seasonal_smoothing += 1
+
+            # Ensure trend window is odd and greater than period for each decomposition
+            adjusted_trend = max(period + 2, self.trend_window)
+            if adjusted_trend % 2 == 0:
+                adjusted_trend += 1
+
+            # Apply STL decomposition with the adjusted trend window
+            stl = STL(remainder, period=period, seasonal=seasonal_smoothing, trend=adjusted_trend, robust=True)
+            result = stl.fit()
+
+            # Store this seasonal component
+            self.seasonal_components[seasonal_id] = result.seasonal
+            self.decomposition[seasonal_id] = result.seasonal
+
+            # If this is the last seasonal period, also store the trend and remainder
+            if i == len(self.seasonal_periods) - 1:
+                self.decomposition['trend'] = result.trend
+                self.decomposition['remainder'] = result.resid
+
+            # Update remainder by removing this seasonal component
+            remainder = remainder - result.seasonal
+
+        # Create a combined seasonal component (sum of all individual seasonal components)
+        self.decomposition['seasonal'] = sum(self.seasonal_components.values())
+
+        return self.decomposition
+
+
+    def _construct_graph(self, seasonal_corr_threshold=0.5):
+        """
+        Construct the Multi-Layer Temporal-Seasonal Network graph.
 
         Parameters:
         -----------
-        start_date : datetime
-            Start date of the interval
-        end_date : datetime
-            End date of the interval
+        seasonal_corr_threshold : float
+            Threshold for seasonal correlation to add seasonal cycle edges
 
         Returns:
         --------
         networkx.DiGraph
-            Subgraph for the specified interval
+            The constructed MTSN graph
+        """
+
+        def calculate_seasonal_correlation(seasonal_component, lag):
+            """Calculate auto-correlation of seasonal component at specified lag"""
+            # Extract the seasonal component series
+            s_series = np.array(seasonal_component)
+            n = len(s_series)
+
+            if lag >= n:
+                return 0.0
+
+            # Calculate mean
+            mean = np.mean(s_series)
+
+            # Calculate numerator (covariance)
+            numerator = 0
+            for i in range(n - lag):
+                numerator += (s_series[i] - mean) * (s_series[i + lag] - mean)
+
+            # Calculate denominator (variance)
+            denominator = np.sum((s_series - mean) ** 2)
+
+            # Return autocorrelation
+            if denominator == 0:
+                return 0.0
+            return numerator / denominator
+
+        # Initialize directed graph
+        self.graph = nx.DiGraph()
+
+        # Add time nodes and component nodes
+        for i, date in enumerate(self.decomposition.index):
+            # Create time node
+            time_node_id = f"t_{i}"
+            self.graph.add_node(time_node_id, type='time', date=date, index=i, value=self.decomposition.iloc[i]['original'])
+
+            # Create component nodes
+            trend_node_id = f"T_{i}"
+            remainder_node_id = f"R_{i}"
+
+            self.graph.add_node(trend_node_id, type='trend', date=date, index=i, value=self.decomposition.iloc[i]['trend'])
+            self.graph.add_node(remainder_node_id, type='remainder', date=date, index=i, value=self.decomposition.iloc[i]['remainder'])
+
+            # Add combined seasonal node
+            seasonal_node_id = f"S_{i}"
+            self.graph.add_node(seasonal_node_id, type='seasonal', date=date, index=i, value=self.decomposition.iloc[i]['seasonal'])
+
+            # Add individual seasonal component nodes
+            for period in self.seasonal_periods:
+                seasonal_id = f"seasonal_{period}"
+                seasonal_comp_node_id = f"S{period}_{i}"
+
+                self.graph.add_node(seasonal_comp_node_id, type='seasonal_component', period=period, date=date, index=i, value=self.decomposition.iloc[i][seasonal_id])
+
+                # Add edge from combined seasonal node to this component
+                self.graph.add_edge(seasonal_node_id, seasonal_comp_node_id, weight=1.0, type='seasonal_decomposition')
+
+            # Add decomposition edges (from time node to primary component nodes)
+            self.graph.add_edge(time_node_id, trend_node_id, weight=1.0, type='decomposition')
+            self.graph.add_edge(time_node_id, seasonal_node_id, weight=1.0, type='decomposition')
+            self.graph.add_edge(time_node_id, remainder_node_id, weight=1.0, type='decomposition')
+
+            # Add temporal progression edges (between consecutive time nodes)
+            if i < len(self.decomposition) - 1:
+                next_time_node_id = f"t_{i + 1}"
+                time_diff = (self.decomposition.index[i + 1] - date).total_seconds() / (24 * 3600)  # in days
+                self.graph.add_edge(time_node_id, next_time_node_id, weight=time_diff, type='temporal_progression')
+
+        # Add seasonal cycle edges for each seasonal period
+        for period in self.seasonal_periods:
+            seasonal_id = f"seasonal_{period}"
+            seasonal_array = np.array(self.seasonal_components[seasonal_id])
+
+            for i in range(len(self.decomposition) - period):
+                seasonal_comp_node_id = f"S{period}_{i}"
+                seasonal_cycle_node_id = f"S{period}_{i + period}"
+
+                seasonal_corr = calculate_seasonal_correlation(seasonal_array, period)
+
+                # Add edge if correlation is significant
+                if  seasonal_corr > seasonal_corr_threshold:
+                    self.graph.add_edge(seasonal_comp_node_id, seasonal_cycle_node_id, weight=seasonal_corr, type='seasonal_cycle', period=period)
+
+        # Add pattern nodes for each identified seasonal pattern
+        for period in self.seasonal_periods:
+            pattern_node_id = f"P_{period}"
+            self.graph.add_node(pattern_node_id, type='pattern', period=period)
+
+            # Connect pattern node to corresponding seasonal component nodes
+            for i in range(self.decomposition.shape[0]):
+                seasonal_comp_node_id = f"S{period}_{i}"
+                phase = i % period
+                seasonal_id = f"seasonal_{period}"
+                amplitude = np.std(self.decomposition[seasonal_id])
+
+                # Weight based on phase of seasonal pattern
+                weight = amplitude * (np.sin(2 * np.pi * phase / period) + 1) / 2  # Scaled to [0,1]
+
+                self.graph.add_edge(pattern_node_id, seasonal_comp_node_id, weight=weight, phase=phase, type='pattern_recognition', period=period)
+
+        # Add interval nodes for common time periods (e.g., quarters, months)
+        self._add_interval_nodes()
+
+        return self.graph
+
+    def _add_interval_nodes(self, interval_types=None):
+        """
+        Add interval nodes for relevant time periods.
+
+        Parameters:
+        -----------
+        interval_types : list of str
+            List of interval types to add (e.g., 'quarterly', 'monthly', 'weekly')
+        """
+        if interval_types is None:
+            interval_types = ['quarterly']  # Default to quarterly for backward compatibility
+
+        dates = [v for k, v in nx.get_node_attributes(self.graph,'date').items() if 't_' in k]
+        min_time = min(sorted(dates))
+        max_time = max(sorted(dates))
+
+        intervals = []
+        if 'daily' in interval_types:
+            current = min_time.replace(hour=0, minute=0, second=0, microsecond=0)
+            while current <= max_time:
+                interval_end = current + timedelta(days=1) - timedelta(microseconds=1)
+                intervals.append((current, min(interval_end, max_time), 'daily'))
+                current += timedelta(days=1)
+        if 'weekly' in interval_types:
+            current = min_time - timedelta(days=min_time.weekday())
+            current = current.replace(hour=0, minute=0, second=0, microsecond=0)
+            while current <= max_time:
+                interval_end = current + timedelta(days=6, hours=23, minutes=59, seconds=59)
+                intervals.append((current, min(interval_end, max_time), 'weekly'))
+                current += timedelta(weeks=1)
+        if 'monthly' in interval_types:
+            current = min_time.replace(day=1, hour=0, minute=0, second=0, microsecond=0)
+            while current <= max_time:
+                next_month = current.month % 12 + 1
+                next_year = current.year + (current.month // 12)
+                interval_end = datetime(next_year, next_month, 1) - timedelta(microseconds=1)
+                if interval_end > max_time:
+                    interval_end = max_time
+                intervals.append((current, interval_end, 'monthly'))
+                current = datetime(next_year, next_month, 1)
+        if 'quarterly' in interval_types:
+            current_year = min_time.year
+            current_quarter = (min_time.month - 1) // 3
+            current = datetime(current_year, current_quarter * 3 + 1, 1)
+            current = current.replace(hour=0, minute=0, second=0, microsecond=0)
+            while current <= max_time:
+                next_quarter = current_quarter + 1
+                if next_quarter > 3:
+                    next_year = current_year + 1
+                    next_quarter = 0
+                else:
+                    next_year = current_year
+                interval_end = datetime(next_year if next_quarter == 0 else current_year, next_quarter * 3 + 1 if next_quarter < 3 else 1,1) - timedelta(microseconds=1)
+                if interval_end > max_time:
+                    interval_end = max_time
+                intervals.append((current, interval_end, 'quarterly'))
+                current_quarter = next_quarter
+                current_year = next_year if next_quarter == 0 else current_year
+                current = datetime(current_year, next_quarter * 3 + 1, 1)
+        if 'yearly' in interval_types:
+            current = datetime(min_time.year, 1, 1)
+            current = current.replace(hour=0, minute=0, second=0, microsecond=0)
+            while current <= max_time:
+                interval_end = datetime(current.year + 1, 1, 1) - timedelta(microseconds=1)
+                if interval_end > max_time:
+                    interval_end = max_time
+                intervals.append((current, interval_end, 'yearly'))
+                current = datetime(current.year + 1, 1, 1)
+
+        # Add interval nodes and edges
+        for start_time, end_time, interval in intervals:
+            time_points = [d for d in [v for k, v in nx.get_node_attributes(self.graph,'date').items() if 't_' in k] if start_time <= d <= end_time]
+            time_points.sort()
+
+            if len(time_points) < 2:
+                return
+
+            interval_node_id = f"I_{start_time}_{end_time}"
+            self.graph.add_node(interval_node_id, type='interval', start=start_time, end=end_time, interval=interval)
+
+            for i in range(len(time_points)):
+                time_node_id = f"T_{time_points[i]}"
+
+                # Calculate true trapezoidal weight
+                if i == 0 or i == len(time_points) - 1:
+                    # For end points, consider time interval to next/previous point
+                    dt = 0
+                    if i == 0 and len(time_points) > 1:
+                        dt = time_points[1] - time_points[0]
+                    elif i == len(time_points) - 1 and len(time_points) > 1:
+                        dt = time_points[i] - time_points[i - 1]
+                    weight = 0.5 * dt
+                else:
+                    # For interior points, use distance to adjacent points
+                    dt_left = time_points[i] - time_points[i - 1]
+                    dt_right = time_points[i + 1] - time_points[i]
+                    weight = 0.5 * (dt_left + dt_right)
+
+                self.graph.add_edge(interval_node_id, time_node_id, weight=weight, type='temporal_integration')
+
+    def temporal_integration(self, component='trend', start_date=None, end_date=None):
+        """
+        Perform temporal integration of a component over a specified time interval.
+
+        Parameters:
+        -----------
+        component : str
+            The component to integrate ('original', 'trend', 'seasonal', 'remainder',
+            or 'seasonal_{period}' for a specific seasonal component)
+        start_date : datetime or str, optional
+            The start date of the integration period
+        end_date : datetime or str, optional
+            The end date of the integration period
+
+        Returns:
+        --------
+        float
+            The integrated value
+        """
+        if self.decomposition is None:
+            raise ValueError("The model must be fitted first using the fit() method")
+
+        # Validate component
+        if component not in self.decomposition.columns:
+            raise ValueError(
+                f"Component '{component}' not found. Available components: {list(self.decomposition.columns)}")
+
+        # Convert string dates to datetime if necessary
+        if isinstance(start_date, str):
+            start_date = pd.to_datetime(start_date)
+        if isinstance(end_date, str):
+            end_date = pd.to_datetime(end_date)
+
+        # If no dates specified, use full range
+        if start_date is None:
+            start_date = self.decomposition.index.min()
+        if end_date is None:
+            end_date = self.decomposition.index.max()
+
+        # Filter data for the specified period
+        mask = (self.decomposition.index >= start_date) & (self.decomposition.index <= end_date)
+        period_data = self.decomposition.loc[mask]
+
+        if len(period_data) == 0:
+            raise ValueError(f"No data found in the specified time range: {start_date} to {end_date}")
+
+        # Convert dates to numeric (days since start) for trapezoidal integration
+        days = [(date - period_data.index[0]).total_seconds() / (24 * 3600) for date in period_data.index]
+        values = period_data[component].values
+
+        # Apply trapezoidal rule for integration
+        integrated_value = np.trapz(values, days)
+
+        return integrated_value
+
+    def detect_hotspots(self, threshold=2.0, component='remainder'):
+        """
+        Detect hotspots in the KPI using graph centrality measures.
+
+        Parameters:
+        -----------
+        threshold : float
+            Z-score threshold for hotspot detection
+        component : str
+            The component to analyze for hotspots ('remainder' by default,
+            can also be 'original', 'seasonal', or a specific seasonal component)
+
+        Returns:
+        --------
+        pandas.DataFrame
+            Detected hotspots with their characteristics
         """
         if self.graph is None:
-            raise ValueError("Graph has not been constructed. Call construct_graph() first.")
+            raise ValueError("The model must be fitted first using the fit() method")
 
-        # Convert to pandas datetime if not already
-        start_date = pd.to_datetime(start_date)
-        end_date = pd.to_datetime(end_date)
+        # Determine node type based on component
+        if component == 'remainder':
+            node_type = 'remainder'
+        elif component == 'original':
+            node_type = 'time'
+        elif component == 'trend':
+            node_type = 'trend'
+        elif component == 'seasonal':
+            node_type = 'seasonal'
+        elif component.startswith('seasonal_'):
+            period = int(component.split('_')[1])
+            # Filter nodes by both type and period
+            target_nodes = [n for n, attr in self.graph.nodes(data=True) if attr.get('type') == 'seasonal_component' and attr.get('period') == period]
+        else:
+            raise ValueError(f"Invalid component '{component}' for hotspot detection")
 
-        # Find nodes within the interval
-        time_nodes = []
-        for node, attr in self.graph.nodes(data=True):
-            if attr.get('type') == 'time' and 'date' in attr:
-                if start_date <= attr['date'] <= end_date:
-                    time_nodes.append(node)
+        # Get the target nodes
+        if not component.startswith('seasonal_'):
+            target_nodes = [n for n, attr in self.graph.nodes(data=True) if attr.get('type') == node_type]
 
-        # Get component nodes for these time nodes
-        component_nodes = []
-        for time_node in time_nodes:
-            for neighbor in self.graph.successors(time_node):
-                component_nodes.append(neighbor)
+        # Initialize subgraph for centrality calculation
+        subgraph = nx.DiGraph()
 
-        # Get interval nodes that overlap with the specified interval
-        interval_nodes = []
-        for node, attr in self.graph.nodes(data=True):
-            if attr.get('type') == 'interval' and 'start_date' in attr and 'end_date' in attr:
-                if attr['start_date'] <= end_date and attr['end_date'] >= start_date:
-                    interval_nodes.append(node)
+        # Add nodes to subgraph
+        for node in target_nodes:
+            subgraph.add_node(node, **self.graph.nodes[node])
 
-        # Get pattern nodes
-        pattern_nodes = [node for node, attr in self.graph.nodes(data=True) if attr.get('type') == 'pattern']
+        # Add edges between consecutive nodes
+        for i in range(len(target_nodes) - 1):
+            node1 = target_nodes[i]
+            node2 = target_nodes[i + 1]
 
-        # Combine all nodes
-        all_nodes = time_nodes + component_nodes + interval_nodes + pattern_nodes
+            val1 = self.graph.nodes[node1]['value']
+            val2 = self.graph.nodes[node2]['value']
 
-        # Create subgraph
-        return self.graph.subgraph(all_nodes)
+            # Weight inversely proportional to value difference
+            weight = 1.0 / (abs(val1 - val2) + 1e-10)
+
+            subgraph.add_edge(node1, node2, weight=weight)
+
+        # Calculate betweenness centrality
+        centrality = nx.betweenness_centrality(subgraph, weight='weight', normalized=True)
+
+        # Extract values and calculate z-scores
+        values = [self.graph.nodes[n]['value'] for n in target_nodes]
+        value_zscores = zscore(values)
+        centrality_zscores = zscore(list(centrality.values()))
+
+        # Identify hotspots
+        hotspots = []
+
+        for i, node in enumerate(target_nodes):
+            idx = self.graph.nodes[node]['index']
+            date = self.graph.nodes[node]['date']
+            value = values[i]
+            value_zscore = value_zscores[i]
+            centrality_zscore = centrality_zscores[i]
+
+            # Hotspot if either value or centrality exceeds threshold
+            if abs(value_zscore) > threshold or abs(centrality_zscore) > threshold:
+                severity = max(abs(value_zscore), abs(centrality_zscore))
+
+                hotspot_data = {
+                    'index': idx,
+                    'date': date,
+                    'component': component,
+                    'value': value,
+                    'value_zscore': value_zscore,
+                    'centrality': centrality[node],
+                    'centrality_zscore': centrality_zscore,
+                    'severity': severity
+                }
+
+                # Add period information for seasonal components
+                if component.startswith('seasonal_'):
+                    hotspot_data['period'] = period
+
+                hotspots.append(hotspot_data)
+
+        # Convert to DataFrame and sort by severity
+        if hotspots:
+            columns = ['index', 'date', 'component', 'value', 'value_zscore', 'centrality', 'centrality_zscore', 'severity']
+            if component.startswith('seasonal_'):
+                columns.append('period')
+            self.hotspots = pd.DataFrame(hotspots, columns=columns).sort_values('severity', ascending=False)
+        else:
+            columns = ['index', 'date', 'component', 'value', 'value_zscore', 'centrality', 'centrality_zscore', 'severity']
+            if component.startswith('seasonal_'):
+                columns.append('period')
+            self.hotspots = pd.DataFrame(columns=columns)
+
+        return self.hotspots
+
+    def get_seasonal_components(self):
+        """
+        Get all seasonal components.
+
+        Returns:
+        --------
+        dict
+            Dictionary of seasonal components with keys 'seasonal_{period}'
+        """
+        if self.seasonal_components is None:
+            raise ValueError("The model must be fitted first using the fit() method")
+
+        return self.seasonal_components

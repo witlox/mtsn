@@ -8,14 +8,6 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-# (Optional) Fetch latest data
-
-```bash
-python fred.py
-python wikip.py
-python uci.py
-```
-
 # Run the notebook
 
 ```bash
