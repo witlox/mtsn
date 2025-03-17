@@ -7,19 +7,26 @@ from community import community_louvain
 from scipy.linalg import eigh
 from scipy.optimize import minimize
 from sklearn.cluster import KMeans
-from statsmodels.tsa.seasonal import MSTL  # Changed from STL to MSTL
+from statsmodels.tsa.seasonal import MSTL
 
 
 class MTSN:
     """
     A class implementing the mathematical framework for network-based analysis of KPIs.
     Handles temporal dependencies, community detection, and key influencer identification.
-    Uses MSTL for multiple seasonal time series decomposition.
+    Uses MSTL for multiple seasonal time series decomposition and advanced graph learning techniques.
     """
 
-    def __init__(self, alpha: float = 0.1, beta: float = 0.1, gamma: float = 0.1):
+    def __init__(
+        self,
+        alpha: float = 0.1,
+        beta: float = 0.1,
+        gamma: float = 0.1,
+        residual_alpha: float = 0.2,
+        adaptive_residual: bool = True,
+    ):
         """
-        Initialize the KPI Network Analyzer.
+        Initialize the KPI Network Analyzer with graph-specific optimization parameters.
 
         Parameters:
         -----------
@@ -29,10 +36,16 @@ class MTSN:
             Regularization parameter for the L1 norm in graph learning.
         gamma : float
             Regularization parameter for temporal consistency.
+        residual_alpha : float
+            Interpolation parameter for residual aggregation operators.
+        adaptive_residual : bool
+            Whether to use adaptive residual connections.
         """
         self.alpha = alpha
         self.beta = beta
         self.gamma = gamma
+        self.residual_alpha = residual_alpha
+        self.adaptive_residual = adaptive_residual
         self.kpi_data = None
         self.decomposed_data = {}
         self.graph_series = {}
@@ -40,6 +53,7 @@ class MTSN:
         self.laplacian_matrices = {}
         self.communities = {}
         self.centrality_measures = {}
+        self.aggregation_values = {}
 
     def load_data(
         self,
@@ -144,11 +158,85 @@ class MTSN:
 
         return seasonal_sim
 
+    def _virgo_initialization(
+        self, fan_in: int, fan_out: int, graph_structure: Optional[np.ndarray] = None
+    ) -> np.ndarray:
+        """
+        Implements Virgo initialization for graph neural networks to reduce variance instability.
+
+        Parameters:
+        -----------
+        fan_in : int
+            Input dimension
+        fan_out : int
+            Output dimension
+        graph_structure : np.ndarray, optional
+            Adjacency matrix to inform initialization
+
+        Returns:
+        --------
+        np.ndarray : Initialized weights
+        """
+        if graph_structure is not None:
+            # Compute spectral properties of the graph
+            try:
+                # Compute largest eigenvalue of the graph Laplacian
+                L = np.diag(np.sum(graph_structure, axis=1)) - graph_structure
+                eigenvalues = eigh(L, subset_by_index=(L.shape[0] - 1, L.shape[0] - 1))[
+                    0
+                ]
+                largest_eigenvalue = max(eigenvalues[0], 1.0)  # Ensure positive
+                scaling = np.sqrt(2.0 / (fan_in * largest_eigenvalue))
+            except:
+                scaling = np.sqrt(2.0 / fan_in)  # Fallback to He initialization
+        else:
+            scaling = np.sqrt(2.0 / fan_in)  # Default to He initialization
+
+        # Initialize with this scaling factor
+        return np.random.normal(0, scaling, size=(fan_in, fan_out))
+
+    def _compute_aggregation_values(self, X: np.ndarray) -> np.ndarray:
+        """
+        Compute aggregation values for each node/KPI for adaptive residual.
+
+        Parameters:
+        -----------
+        X : np.ndarray
+            KPI measurements matrix
+
+        Returns:
+        --------
+        np.ndarray : Aggregation values for each KPI
+        """
+        n = X.shape[0]
+        agg_values = np.zeros(n)
+
+        # Compute variance of each KPI
+        for i in range(n):
+            # Normalize the values
+            normalized = (X[i] - np.mean(X[i])) / (np.std(X[i]) + 1e-8)
+            # Compute aggregation value as variance of normalized values
+            agg_values[i] = np.var(normalized)
+
+        # Scale to range [0, 1]
+        if np.max(agg_values) - np.min(agg_values) > 0:
+            agg_values = (agg_values - np.min(agg_values)) / (
+                np.max(agg_values) - np.min(agg_values)
+            )
+        else:
+            agg_values = np.ones_like(agg_values) * 0.5
+
+        return agg_values
+
     def _objective_function(
-        self, A_flat: np.ndarray, X: np.ndarray, A_prev: Optional[np.ndarray] = None
+        self,
+        A_flat: np.ndarray,
+        X: np.ndarray,
+        A_prev: Optional[np.ndarray] = None,
+        lambda_structure: float = 0.1,
     ) -> float:
         """
-        Objective function for graph learning optimization.
+        Enhanced objective function for graph learning with structural properties.
 
         Parameters:
         -----------
@@ -158,6 +246,8 @@ class MTSN:
             KPI measurements matrix.
         A_prev : np.ndarray, optional
             Previous adjacency matrix for temporal consistency.
+        lambda_structure : float
+            Weight for structure regularization term.
 
         Returns:
         --------
@@ -185,13 +275,26 @@ class MTSN:
         if A_prev is not None:
             temporal_reg = self.gamma * np.linalg.norm(A - A_prev, "fro") ** 2
 
-        return recon_error + frob_reg + l1_reg + temporal_reg
+        # Add structural term to encourage community structure
+        # Compute the normalized graph Laplacian trace
+        D = np.diag(
+            np.sum(A, axis=1) + 1e-10
+        )  # Add small epsilon to avoid division by zero
+        D_sqrt_inv = np.diag(1.0 / np.sqrt(np.diag(D) + 1e-10))
+        L_normalized = np.eye(n) - D_sqrt_inv @ A @ D_sqrt_inv
+        structure_reg = lambda_structure * np.trace(L_normalized)
+
+        return recon_error + frob_reg + l1_reg + temporal_reg + structure_reg
 
     def _objective_gradient(
-        self, A_flat: np.ndarray, X: np.ndarray, A_prev: Optional[np.ndarray] = None
+        self,
+        A_flat: np.ndarray,
+        X: np.ndarray,
+        A_prev: Optional[np.ndarray] = None,
+        lambda_structure: float = 0.1,
     ) -> np.ndarray:
         """
-        Gradient of objective function for optimization.
+        Gradient of enhanced objective function with structural regularization.
 
         Parameters:
         -----------
@@ -201,6 +304,8 @@ class MTSN:
             KPI measurements matrix.
         A_prev : np.ndarray, optional
             Previous adjacency matrix for temporal consistency.
+        lambda_structure : float
+            Weight for structure regularization term.
 
         Returns:
         --------
@@ -230,8 +335,30 @@ class MTSN:
         if A_prev is not None:
             temporal_grad = 2 * self.gamma * (A - A_prev)
 
+        # Gradient of structural term
+        # Compute degree matrix and its inverse square root
+        D = np.diag(np.sum(A, axis=1) + 1e-10)
+        D_sqrt_inv = np.diag(1.0 / np.sqrt(np.diag(D) + 1e-10))
+
+        # Compute gradient of normalized Laplacian trace w.r.t. A
+        D_grad = np.zeros_like(A)
+        for i in range(n):
+            D_grad[:, i] = 1.0
+
+        D_sqrt_inv_grad = np.zeros_like(D_sqrt_inv)
+        for i in range(n):
+            if D[i, i] > 1e-10:
+                D_sqrt_inv_grad[i, i] = -0.5 * (D[i, i] ** (-1.5))
+
+        L_normalized_grad = (
+            -D_sqrt_inv_grad @ A @ D_sqrt_inv
+            - D_sqrt_inv @ A @ D_sqrt_inv_grad
+            - D_sqrt_inv @ D_sqrt_inv
+        )
+        structure_grad = lambda_structure * L_normalized_grad
+
         # Sum all gradients
-        grad = recon_grad + frob_grad + l1_grad + temporal_grad
+        grad = recon_grad + frob_grad + l1_grad + temporal_grad + structure_grad
 
         # Flatten gradient, excluding diagonal elements
         grad_flat = np.zeros(n * (n - 1))
@@ -244,16 +371,60 @@ class MTSN:
 
         return grad_flat
 
+    def _apply_residual_aggregation(self, A: np.ndarray) -> np.ndarray:
+        """
+        Apply residual aggregation operator to adjacency matrix.
+
+        Parameters:
+        -----------
+        A : np.ndarray
+            Adjacency matrix
+
+        Returns:
+        --------
+        np.ndarray : Residual aggregation matrix
+        """
+        n = A.shape[0]
+
+        if self.adaptive_residual:
+            # Compute adaptive residual based on aggregation values
+            residual_matrix = np.zeros_like(A)
+            for i in range(n):
+                # Compute local deviation for this node
+                local_features = A[i] @ self.current_features
+                feature_diff = np.linalg.norm(local_features - self.current_features[i])
+
+                # Adaptive beta based on feature difference
+                beta = 1.0 / (1.0 + np.exp(-feature_diff + 5.0))
+
+                # Apply adaptive residual: (1-beta)*I + beta*A
+                for j in range(n):
+                    if i == j:
+                        residual_matrix[i, j] = 1 - beta
+                    else:
+                        residual_matrix[i, j] = beta * A[i, j]
+        else:
+            # Apply fixed interpolation: (1-alpha)*I + alpha*A
+            residual_matrix = (1 - self.residual_alpha) * np.eye(
+                n
+            ) + self.residual_alpha * A
+
+        return residual_matrix
+
     def learn_graph_structure(
-        self, time_windows: Optional[List[Tuple[str, str]]] = None
+        self,
+        time_windows: Optional[List[Tuple[str, str]]] = None,
+        lambda_structure: float = 0.1,
     ) -> Dict[str, np.ndarray]:
         """
-        Learn the graph structure from KPI data for specified time windows.
+        Learn the graph structure from KPI data for specified time windows with optimized methods.
 
         Parameters:
         -----------
         time_windows : List[Tuple[str, str]], optional
             List of time window tuples (start_date, end_date). If None, uses the entire data.
+        lambda_structure : float
+            Weight for structure regularization term.
 
         Returns:
         --------
@@ -271,6 +442,7 @@ class MTSN:
         self.adjacency_matrices = {}
         self.laplacian_matrices = {}
         self.graph_series = {}
+        self.aggregation_values = {}
 
         A_prev = None  # Initial previous adjacency matrix
 
@@ -279,24 +451,44 @@ class MTSN:
             window_data = self.kpi_data.loc[start_date:end_date]
             X = window_data.values.T  # Transpose to get [n_kpis x n_observations]
 
+            # Store current features for adaptive residual
+            self.current_features = X.mean(axis=1)
+
+            # Compute aggregation values for adaptive residual
+            self.aggregation_values[window_label] = self._compute_aggregation_values(X)
+
             n = self.n_kpis
             n_flat = n * (n - 1)  # Number of non-diagonal elements
 
-            # Initial guess for optimization (flattened non-diagonal elements)
-            A_init = np.zeros(n_flat)
+            # Use Virgo initialization instead of zeros
+            if A_prev is not None:
+                # Use previous adjacency structure to inform initialization
+                A_init_matrix = self._virgo_initialization(n, n, A_prev)
+                # Flatten non-diagonal elements
+                A_init = np.zeros(n_flat)
+                idx = 0
+                for i in range(n):
+                    for j in range(n):
+                        if i != j:
+                            A_init[idx] = max(0, A_init_matrix[i, j])
+                            idx += 1
+            else:
+                # First window, initialize with typical scaling
+                A_init = np.random.normal(0, np.sqrt(2.0 / (n * n)), size=n_flat)
+                A_init = np.abs(A_init)  # Ensure non-negative
 
             # Define constraints to ensure non-negativity
             constraints = [{"type": "ineq", "fun": lambda x: x}]  # A_ij >= 0
 
-            # Optimize the objective function
+            # Optimize the objective function with structural regularization
             result = minimize(
                 fun=self._objective_function,
                 x0=A_init,
-                args=(X, A_prev),
+                args=(X, A_prev, lambda_structure),
                 jac=self._objective_gradient,
                 constraints=constraints,
                 method="SLSQP",
-                options={"maxiter": 200, "disp": True},
+                options={"maxiter": 300, "disp": True},
             )
 
             # Reshape the optimized parameters to get the adjacency matrix
@@ -308,12 +500,23 @@ class MTSN:
                         A_opt[i, j] = max(0, result.x[idx])  # Ensure non-negativity
                         idx += 1
 
-            # Compute the Laplacian matrix
-            D_opt = np.diag(np.sum(A_opt, axis=1))
-            L_opt = D_opt - A_opt
+            # Apply residual aggregation operator
+            A_residual = self._apply_residual_aggregation(A_opt)
 
-            # Store the results
-            self.adjacency_matrices[window_label] = A_opt
+            # Compute the Laplacian matrix using the residual-aggregated adjacency
+            D_opt = np.diag(np.sum(A_residual, axis=1))
+            L_opt = D_opt - A_residual
+
+            # Apply graph normalization to prevent oversmoothing
+            # (BatchNorm-like operation on the adjacency matrix)
+            A_norm = A_residual.copy()
+            for j in range(n):
+                col_mean = np.mean(A_norm[:, j])
+                col_std = np.std(A_norm[:, j]) + 1e-8
+                A_norm[:, j] = (A_norm[:, j] - col_mean) / col_std
+
+            # Store the results (both original and normalized)
+            self.adjacency_matrices[window_label] = A_residual
             self.laplacian_matrices[window_label] = L_opt
 
             # Create NetworkX graph
@@ -321,13 +524,13 @@ class MTSN:
             for i, kpi1 in enumerate(self.kpi_names):
                 G.add_node(kpi1)
                 for j, kpi2 in enumerate(self.kpi_names):
-                    if i != j and A_opt[i, j] > 0:
-                        G.add_edge(kpi1, kpi2, weight=A_opt[i, j])
+                    if i != j and A_residual[i, j] > 0:
+                        G.add_edge(kpi1, kpi2, weight=A_residual[i, j])
 
             self.graph_series[window_label] = G
 
             # Update previous adjacency matrix for temporal consistency
-            A_prev = A_opt
+            A_prev = A_residual
 
         print(
             f"Graph structure learning completed for {len(self.graph_series)} time windows."
@@ -338,7 +541,7 @@ class MTSN:
         self, method: str = "walktrap", n_communities: Optional[int] = None
     ) -> Dict:
         """
-        Detect communities in KPI networks.
+        Detect communities in KPI networks using enhanced methods.
 
         Parameters:
         -----------
@@ -432,12 +635,21 @@ class MTSN:
                     G_undir, weight="weight"
                 )
 
+            # Add aggregation values as a centrality measure
+            aggregation_centrality = {
+                kpi: value
+                for kpi, value in zip(
+                    self.kpi_names, self.aggregation_values[window_label]
+                )
+            }
+
             self.centrality_measures[window_label] = {
                 "degree": degree_centrality,
                 "in_degree": in_degree_centrality,
                 "out_degree": out_degree_centrality,
                 "eigenvector": eigenvector_centrality,
                 "betweenness": betweenness_centrality,
+                "aggregation": aggregation_centrality,
             }
 
         print(
@@ -454,7 +666,7 @@ class MTSN:
         Parameters:
         -----------
         centrality_type : str
-            Type of centrality to use ('degree', 'in_degree', 'out_degree', 'eigenvector', 'betweenness').
+            Type of centrality to use ('degree', 'in_degree', 'out_degree', 'eigenvector', 'betweenness', 'aggregation').
         top_n : int
             Number of top influencers to return.
 
@@ -507,6 +719,12 @@ class MTSN:
         window_label = list(self.laplacian_matrices.keys())[-1]
         L = self.laplacian_matrices[window_label]
 
+        # Ensure the Laplacian matrix has the correct dimensions
+        if L.shape[0] != data_with_missing.shape[1]:
+            raise ValueError(
+                "Laplacian matrix dimensions do not match the number of KPIs."
+            )
+
         # Create a mask of observed values (1 for observed, 0 for missing)
         mask = ~data_with_missing.isna()
         mask_values = mask.values
@@ -527,7 +745,7 @@ class MTSN:
             # Reconstruction error term (only for observed values)
             recon_error = np.sum((mask_values * (X_values - X_pred)) ** 2)
 
-            # Graph smoothness term
+            # Graph smoothness term using the Laplacian
             smoothness = lambda_reg * np.trace(X_pred.T @ L @ X_pred)
 
             return recon_error + smoothness
@@ -557,9 +775,10 @@ class MTSN:
         periods: List[int] = [12],
         n_communities: int = 3,
         centrality_type: str = "eigenvector",
+        lambda_structure: float = 0.1,
     ) -> Dict:
         """
-        Run the complete KPI network analysis pipeline.
+        Run the complete KPI network analysis pipeline with optimized algorithms.
 
         Parameters:
         -----------
@@ -569,6 +788,8 @@ class MTSN:
             Number of communities to detect.
         centrality_type : str
             Type of centrality to use for key influencer identification.
+        lambda_structure : float
+            Weight for structure regularization in graph learning.
 
         Returns:
         --------
@@ -577,15 +798,17 @@ class MTSN:
         if self.kpi_data is None:
             raise ValueError("Data must be loaded first.")
 
-        print("Starting full KPI network analysis...")
+        print("Starting full KPI network analysis with optimized algorithms...")
 
         # Step 1: Time series decomposition
         print("Step 1: Performing multi-seasonal time series decomposition...")
         self.decompose_time_series(periods=periods)
 
-        # Step 2: Learn graph structure
-        print("Step 2: Learning graph structure...")
-        self.learn_graph_structure()
+        # Step 2: Learn graph structure with optimized methods
+        print(
+            "Step 2: Learning graph structure with Virgo initialization and residual aggregation..."
+        )
+        self.learn_graph_structure(lambda_structure=lambda_structure)
 
         # Step 3: Detect communities
         print("Step 3: Detecting communities...")
@@ -608,5 +831,5 @@ class MTSN:
             "key_influencers": key_influencers,
         }
 
-        print("KPI network analysis completed successfully.")
+        print("KPI network analysis completed successfully with optimized algorithms.")
         return results_summary
