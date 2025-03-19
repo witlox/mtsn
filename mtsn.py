@@ -1,3 +1,5 @@
+import logging
+
 from typing import Dict, List, Tuple, Optional
 
 import networkx as nx
@@ -77,11 +79,14 @@ class MTSN:
             kpi_columns = [col for col in data.columns if col != date_column]
 
         # Set date as index and extract only KPI columns
-        self.kpi_data = data.set_index(date_column)[kpi_columns].copy()
+        if date_column not in data.columns:
+            self.kpi_data = data[kpi_columns].copy()
+        else:
+            self.kpi_data = data.set_index(date_column)[kpi_columns].copy()
         self.kpi_names = kpi_columns
         self.n_kpis = len(kpi_columns)
 
-        print(
+        logging.info(
             f"Loaded data with {self.n_kpis} KPIs and {len(self.kpi_data)} time points."
         )
 
@@ -129,7 +134,7 @@ class MTSN:
                 "original": series,
             }
 
-        print(
+        logging.info(
             f"Multi-seasonal time series decomposition completed for {len(self.decomposed_data)} KPIs."
         )
         return self.decomposed_data
@@ -187,7 +192,8 @@ class MTSN:
                 ]
                 largest_eigenvalue = max(eigenvalues[0], 1.0)  # Ensure positive
                 scaling = np.sqrt(2.0 / (fan_in * largest_eigenvalue))
-            except:
+            except Exception as e:
+                logging.exception(e)
                 scaling = np.sqrt(2.0 / fan_in)  # Fallback to He initialization
         else:
             scaling = np.sqrt(2.0 / fan_in)  # Default to He initialization
@@ -280,7 +286,15 @@ class MTSN:
         D = np.diag(
             np.sum(A, axis=1) + 1e-10
         )  # Add small epsilon to avoid division by zero
-        D_sqrt_inv = np.diag(1.0 / np.sqrt(np.diag(D) + 1e-10))
+        D_diag = np.diag(D) + 1e-10
+        # Ensure values are non-negative before sqrt
+        D_diag_safe = np.maximum(D_diag, 0)
+        # Compute sqrt only for positive values
+        D_sqrt_inv_diag = np.zeros_like(D_diag)
+        mask = D_diag_safe > 0
+        D_sqrt_inv_diag[mask] = 1.0 / np.sqrt(D_diag_safe[mask])
+        D_sqrt_inv = np.diag(D_sqrt_inv_diag)
+
         L_normalized = np.eye(n) - D_sqrt_inv @ A @ D_sqrt_inv
         structure_reg = lambda_structure * np.trace(L_normalized)
 
@@ -532,7 +546,7 @@ class MTSN:
             # Update previous adjacency matrix for temporal consistency
             A_prev = A_residual
 
-        print(
+        logging.info(
             f"Graph structure learning completed for {len(self.graph_series)} time windows."
         )
         return self.adjacency_matrices
@@ -601,7 +615,7 @@ class MTSN:
 
             self.communities[window_label] = partition
 
-        print(
+        logging.info(
             f"Community detection completed for {len(self.communities)} time windows."
         )
         return self.communities
@@ -629,7 +643,8 @@ class MTSN:
             # For betweenness centrality, create undirected graph if needed
             try:
                 betweenness_centrality = nx.betweenness_centrality(G, weight="weight")
-            except:
+            except Exception as e:
+                logging.exception(e)
                 G_undir = G.to_undirected()
                 betweenness_centrality = nx.betweenness_centrality(
                     G_undir, weight="weight"
@@ -652,7 +667,7 @@ class MTSN:
                 "aggregation": aggregation_centrality,
             }
 
-        print(
+        logging.info(
             f"Centrality measures computed for {len(self.centrality_measures)} time windows."
         )
         return self.centrality_measures
@@ -732,7 +747,7 @@ class MTSN:
         # Initialize with mean imputation
         X_init = data_with_missing.copy()
         for col in X_init.columns:
-            X_init[col].fillna(X_init[col].mean(), inplace=True)
+            X_init[col] = X_init[col].fillna(X_init[col].mean())
 
         X_values = X_init.values
 
@@ -746,7 +761,11 @@ class MTSN:
             recon_error = np.sum((mask_values * (X_values - X_pred)) ** 2)
 
             # Graph smoothness term using the Laplacian
-            smoothness = lambda_reg * np.trace(X_pred.T @ L @ X_pred)
+            smoothness = 0
+            for t in range(X_pred.shape[0]):
+                x_t = X_pred[t]  # Shape (n_kpis,)
+                smoothness += x_t @ L @ x_t  # Scalar
+            smoothness *= lambda_reg
 
             return recon_error + smoothness
 
@@ -767,7 +786,7 @@ class MTSN:
             X_pred, index=data_with_missing.index, columns=data_with_missing.columns
         )
 
-        print(f"Missing value prediction completed.")
+        logging.info(f"Missing value prediction completed.")
         return predicted_df
 
     def run_full_analysis(
@@ -798,28 +817,28 @@ class MTSN:
         if self.kpi_data is None:
             raise ValueError("Data must be loaded first.")
 
-        print("Starting full KPI network analysis with optimized algorithms...")
+        logging.info("Starting full KPI network analysis with optimized algorithms...")
 
         # Step 1: Time series decomposition
-        print("Step 1: Performing multi-seasonal time series decomposition...")
+        logging.info("Step 1: Performing multi-seasonal time series decomposition...")
         self.decompose_time_series(periods=periods)
 
         # Step 2: Learn graph structure with optimized methods
-        print(
+        logging.info(
             "Step 2: Learning graph structure with Virgo initialization and residual aggregation..."
         )
         self.learn_graph_structure(lambda_structure=lambda_structure)
 
         # Step 3: Detect communities
-        print("Step 3: Detecting communities...")
+        logging.info("Step 3: Detecting communities...")
         self.detect_communities(method="spectral", n_communities=n_communities)
 
         # Step 4: Compute centrality measures
-        print("Step 4: Computing centrality measures...")
+        logging.info("Step 4: Computing centrality measures...")
         self.compute_centrality_measures()
 
         # Step 5: Identify key influencers
-        print("Step 5: Identifying key influencers...")
+        logging.info("Step 5: Identifying key influencers...")
         key_influencers = self.identify_key_influencers(centrality_type=centrality_type)
 
         # Prepare summary of results
@@ -831,5 +850,7 @@ class MTSN:
             "key_influencers": key_influencers,
         }
 
-        print("KPI network analysis completed successfully with optimized algorithms.")
+        logging.info(
+            "KPI network analysis completed successfully with optimized algorithms."
+        )
         return results_summary
