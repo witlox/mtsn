@@ -108,9 +108,9 @@ class MTSN:
         self.decomposed_data = {}
 
         for kpi in self.kpi_names:
-            if self.kpi_data[kpi].isnull().sum() > 0:
+            if self.kpi_data[kpi].isnull().sum() > 0 or self.kpi_data[kpi].hasnans:
                 # Handle missing values with simple interpolation for decomposition
-                series = self.kpi_data[kpi].interpolate(method="linear")
+                series = self.kpi_data[kpi].interpolate(method="polynomial", order=2)
             else:
                 series = self.kpi_data[kpi]
 
@@ -352,7 +352,16 @@ class MTSN:
         # Gradient of structural term
         # Compute degree matrix and its inverse square root
         D = np.diag(np.sum(A, axis=1) + 1e-10)
-        D_sqrt_inv = np.diag(1.0 / np.sqrt(np.diag(D) + 1e-10))
+
+        # Enhanced diagonal normalization with numerical safeguards
+        d = np.diag(D)
+
+        # Multi-stage stabilization process
+        d_safe = np.nan_to_num(d, nan=1e-10)  # Handle NaN values
+        d_safe = np.maximum(d_safe, 1e-10)  # Enforce minimum positive threshold
+        d_safe = np.where(d_safe > 1e8, 1e8, d_safe)  # Prevent overflow in reciprocal
+
+        D_sqrt_inv = np.diag(1.0 / np.sqrt(d_safe))
 
         # Compute gradient of normalized Laplacian trace w.r.t. A
         D_grad = np.zeros_like(A)
@@ -463,6 +472,13 @@ class MTSN:
         for window_label, start_date, end_date in time_windows:
             # Extract data for the current time window
             window_data = self.kpi_data.loc[start_date:end_date]
+
+            # interpolate missing values
+            window_data = window_data.interpolate(method="polynomial", order=2)
+
+            # remove left over NaN
+            window_data.dropna(inplace=True)
+
             X = window_data.values.T  # Transpose to get [n_kpis x n_observations]
 
             # Store current features for adaptive residual
@@ -638,7 +654,15 @@ class MTSN:
             degree_centrality = nx.degree_centrality(G)
             in_degree_centrality = nx.in_degree_centrality(G)
             out_degree_centrality = nx.out_degree_centrality(G)
-            eigenvector_centrality = nx.eigenvector_centrality_numpy(G, weight="weight")
+
+            def perturbed_eigenvector_centrality(G, epsilon=1e-6):
+                A = nx.to_numpy_array(G)
+                # Add weak connections between components
+                A_perturbed = A + epsilon * np.ones(A.shape)
+                G_perturbed = nx.from_numpy_array(A_perturbed)
+                return nx.eigenvector_centrality_numpy(G_perturbed)
+
+            eigenvector_centrality = perturbed_eigenvector_centrality(G)
 
             # For betweenness centrality, create undirected graph if needed
             try:
