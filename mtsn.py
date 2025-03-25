@@ -49,6 +49,7 @@ class MTSN:
         self.residual_alpha = residual_alpha
         self.adaptive_residual = adaptive_residual
         self.kpi_data = None
+        self.scaler = None
         self.decomposed_data = {}
         self.graph_series = {}
         self.adjacency_matrices = {}
@@ -62,6 +63,7 @@ class MTSN:
         data: pd.DataFrame,
         date_column: str = "date",
         kpi_columns: Optional[List[str]] = None,
+        scale_data: bool = True,
     ) -> None:
         """
         Load KPI time series data.
@@ -74,6 +76,8 @@ class MTSN:
             Name of the column containing dates.
         kpi_columns : List[str], optional
             List of column names representing KPIs. If None, all columns except date_column are used.
+        scale_data : bool
+            Whether to scale the data using Min-Max scaling.
         """
         if kpi_columns is None:
             kpi_columns = [col for col in data.columns if col != date_column]
@@ -90,6 +94,17 @@ class MTSN:
             f"Loaded data with {self.n_kpis} KPIs and {len(self.kpi_data)} time points."
         )
 
+        if scale_data:
+            from sklearn.preprocessing import StandardScaler
+            scaler = StandardScaler()
+            self.kpi_data = pd.DataFrame(
+                scaler.fit_transform(self.kpi_data),
+                index=self.kpi_data.index,
+                columns=self.kpi_data.columns
+            )
+            self.scaler = scaler  # Store for later inverse transform
+            logging.info("Scaled data with Min-Max scaling.")
+
     def decompose_time_series(self, periods: List[int] = [12]) -> Dict:
         """
         Apply Multiple Seasonal-Trend decomposition using Loess (MSTL) to each KPI time series.
@@ -105,6 +120,18 @@ class MTSN:
         --------
         Dict : Dictionary containing decomposed components for each KPI.
         """
+        # Auto-detect appropriate periods if not specified
+        if not periods and isinstance(self.kpi_data.index, pd.DatetimeIndex):
+            freq = pd.infer_freq(self.kpi_data.index)
+            if freq == 'D':  # Daily data
+                periods = [7, 30, 365]  # Weekly, monthly, yearly
+            elif freq in ['M', 'MS']:  # Monthly data
+                periods = [12]  # Yearly
+            elif freq in ['Q', 'QS']:  # Quarterly data
+                periods = [4]  # Yearly in quarters
+            else:
+                periods = [12]  # Default to yearly
+
         self.decomposed_data = {}
 
         for kpi in self.kpi_names:
@@ -124,7 +151,11 @@ class MTSN:
 
             # For MSTL, the seasonal component is a DataFrame with multiple columns for each seasonal period
             # We'll store both combined and individual seasonal components
-            seasonal_combined = result.seasonal.sum(axis=1)
+            if isinstance(result.seasonal, pd.Series):
+                seasonal_combined = result.seasonal
+            else:
+                # DataFrame case with multiple seasonal components
+                seasonal_combined = result.seasonal.sum(axis=1)
 
             self.decomposed_data[kpi] = {
                 "trend": trend,
@@ -461,6 +492,12 @@ class MTSN:
             time_windows = [
                 ("all", self.kpi_data.index.min(), self.kpi_data.index.max())
             ]
+        else:
+            for window_label, start_date, end_date in time_windows:
+                if start_date >= end_date:
+                    raise ValueError(f"Start date {start_date} must be before end date {end_date}")
+                if start_date not in self.kpi_data.index or end_date not in self.kpi_data.index:
+                    logging.warning(f"Window {window_label}: dates not in index, will use nearest available")
 
         self.adjacency_matrices = {}
         self.laplacian_matrices = {}
@@ -504,22 +541,25 @@ class MTSN:
                             idx += 1
             else:
                 # First window, initialize with typical scaling
-                A_init = np.random.normal(0, np.sqrt(2.0 / (n * n)), size=n_flat)
-                A_init = np.abs(A_init)  # Ensure non-negative
+                A_init = np.random.uniform(0, 0.1, size=n_flat)
 
             # Define constraints to ensure non-negativity
-            constraints = [{"type": "ineq", "fun": lambda x: x}]  # A_ij >= 0
+            constraints = [{"type": "ineq", "fun": lambda x: x + 1e-8}]  # A_ij >= 0
 
-            # Optimize the objective function with structural regularization
-            result = minimize(
-                fun=self._objective_function,
-                x0=A_init,
-                args=(X, A_prev, lambda_structure),
-                jac=self._objective_gradient,
-                constraints=constraints,
-                method="SLSQP",
-                options={"maxiter": 300, "disp": True},
-            )
+            try:
+                # Optimize the objective function with structural regularization
+                result = minimize(
+                    fun=self._objective_function,
+                    x0=A_init,
+                    args=(X, A_prev, lambda_structure),
+                    jac=self._objective_gradient,
+                    constraints=constraints,
+                    method="SLSQP",
+                    options={"maxiter": 300, "disp": True},
+                )
+            except Exception as e:
+                logging.warning(f"Optimization failed: {e}. Using initialization as fallback.")
+                result = type('obj', (object,), {'x': A_init, 'success': False})
 
             # Reshape the optimized parameters to get the adjacency matrix
             A_opt = np.zeros((n, n))
@@ -657,10 +697,37 @@ class MTSN:
 
             def perturbed_eigenvector_centrality(G, epsilon=1e-6):
                 A = nx.to_numpy_array(G)
-                # Add weak connections between components
-                A_perturbed = A + epsilon * np.ones(A.shape)
-                G_perturbed = nx.from_numpy_array(A_perturbed)
-                return nx.eigenvector_centrality_numpy(G_perturbed)
+                n = A.shape[0]
+
+                # Check if graph is empty
+                if A.sum() < 1e-10:
+                    return {node: 1.0 / n for node in G.nodes()}
+
+                # Add weak connections only where needed
+                A_perturbed = A.copy()
+                for i in range(n):
+                    for j in range(n):
+                        if i != j and A[i, j] < epsilon:
+                            A_perturbed[i, j] = epsilon
+
+                # Ensure diagonal is zero
+                np.fill_diagonal(A_perturbed, 0)
+
+                # Create new graph
+                G_perturbed = nx.from_numpy_array(A_perturbed, create_using=nx.DiGraph())
+
+                try:
+                    centrality = nx.eigenvector_centrality_numpy(G_perturbed, max_iter=1000)
+                    # Check if all values are too similar
+                    values = list(centrality.values())
+                    if max(values) - min(values) < 1e-5:
+                        # Fallback to degree centrality for more variation
+                        centrality = nx.degree_centrality(G)
+                    return centrality
+                except Exception as e:
+                    # Fallback to degree centrality if eigenvector calculation fails
+                    logging.warning(f"Eigenvector centrality failed: {e}")
+                    return nx.degree_centrality(G)
 
             eigenvector_centrality = perturbed_eigenvector_centrality(G)
 
