@@ -96,11 +96,12 @@ class MTSN:
 
         if scale_data:
             from sklearn.preprocessing import StandardScaler
+
             scaler = StandardScaler()
             self.kpi_data = pd.DataFrame(
                 scaler.fit_transform(self.kpi_data),
                 index=self.kpi_data.index,
-                columns=self.kpi_data.columns
+                columns=self.kpi_data.columns,
             )
             self.scaler = scaler  # Store for later inverse transform
             logging.info("Scaled data with Min-Max scaling.")
@@ -123,11 +124,11 @@ class MTSN:
         # Auto-detect appropriate periods if not specified
         if not periods and isinstance(self.kpi_data.index, pd.DatetimeIndex):
             freq = pd.infer_freq(self.kpi_data.index)
-            if freq == 'D':  # Daily data
+            if freq == "D":  # Daily data
                 periods = [7, 30, 365]  # Weekly, monthly, yearly
-            elif freq in ['M', 'MS']:  # Monthly data
+            elif freq in ["M", "MS"]:  # Monthly data
                 periods = [12]  # Yearly
-            elif freq in ['Q', 'QS']:  # Quarterly data
+            elif freq in ["Q", "QS"]:  # Quarterly data
                 periods = [4]  # Yearly in quarters
             else:
                 periods = [12]  # Default to yearly
@@ -495,9 +496,16 @@ class MTSN:
         else:
             for window_label, start_date, end_date in time_windows:
                 if start_date >= end_date:
-                    raise ValueError(f"Start date {start_date} must be before end date {end_date}")
-                if start_date not in self.kpi_data.index or end_date not in self.kpi_data.index:
-                    logging.warning(f"Window {window_label}: dates not in index, will use nearest available")
+                    raise ValueError(
+                        f"Start date {start_date} must be before end date {end_date}"
+                    )
+                if (
+                    start_date not in self.kpi_data.index
+                    or end_date not in self.kpi_data.index
+                ):
+                    logging.warning(
+                        f"Window {window_label}: dates not in index, will use nearest available"
+                    )
 
         self.adjacency_matrices = {}
         self.laplacian_matrices = {}
@@ -558,8 +566,10 @@ class MTSN:
                     options={"maxiter": 300, "disp": True},
                 )
             except Exception as e:
-                logging.warning(f"Optimization failed: {e}. Using initialization as fallback.")
-                result = type('obj', (object,), {'x': A_init, 'success': False})
+                logging.warning(
+                    f"Optimization failed: {e}. Using initialization as fallback."
+                )
+                result = type("obj", (object,), {"x": A_init, "success": False})
 
             # Reshape the optimized parameters to get the adjacency matrix
             A_opt = np.zeros((n, n))
@@ -634,7 +644,10 @@ class MTSN:
                 # For walktrap, convert to undirected graph with weights
                 G_undir = G.to_undirected()
                 # Use community_louvain as an approximation to walktrap
-                partition = community_louvain.best_partition(G_undir)
+                import igraph
+
+                G_igraph = igraph.Graph.Weighted_Adjacency(G_undir)
+                partition = G_igraph.community_walktrap().as_clustering().membership
 
             elif method == "louvain":
                 # Convert to undirected graph with weights
@@ -714,10 +727,14 @@ class MTSN:
                 np.fill_diagonal(A_perturbed, 0)
 
                 # Create new graph
-                G_perturbed = nx.from_numpy_array(A_perturbed, create_using=nx.DiGraph())
+                G_perturbed = nx.from_numpy_array(
+                    A_perturbed, create_using=nx.DiGraph()
+                )
 
                 try:
-                    centrality = nx.eigenvector_centrality_numpy(G_perturbed, max_iter=1000)
+                    centrality = nx.eigenvector_centrality_numpy(
+                        G_perturbed, max_iter=1000
+                    )
                     # Check if all values are too similar
                     values = list(centrality.values())
                     if max(values) - min(values) < 1e-5:

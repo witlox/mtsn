@@ -10,4 +10,5 @@ seaborn
 scikit-learn
 networkx
 python-louvain
+python-igraph
 jupyter
