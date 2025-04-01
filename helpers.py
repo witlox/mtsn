@@ -12,8 +12,13 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 from mtsn import MTSN
 
 
-def compute_confidence_interval(data: np.ndarray, metric_func: callable, num_samples: int = 1000):
-    bootstrap_samples = [metric_func(np.random.choice(data, size=len(data), replace=True)) for _ in range(num_samples)]
+def compute_confidence_interval(
+    data: np.ndarray, metric_func: callable, num_samples: int = 1000
+):
+    bootstrap_samples = [
+        metric_func(np.random.choice(data, size=len(data), replace=True))
+        for _ in range(num_samples)
+    ]
     lower_bound = np.percentile(bootstrap_samples, 2.5)
     upper_bound = np.percentile(bootstrap_samples, 97.5)
     return lower_bound, upper_bound
@@ -55,6 +60,7 @@ def visualize_kpi_network(
     figsize : Tuple[int, int]
         Figure size.
     """
+    logger = logging.getLogger(__name__)
     G = mtsn.graph_series[window_label]
 
     # Create a copy of the graph with filtered edges
@@ -79,9 +85,13 @@ def visualize_kpi_network(
     if window_label in mtsn.centrality_measures:
         if centrality_size in mtsn.centrality_measures[window_label]:
             centrality_dict = mtsn.centrality_measures[window_label][centrality_size]
-            node_sizes = [1000 * (0.1+ np.log1p(centrality_dict[node])) for node in G_viz.nodes()]
+            node_sizes = [
+                1000 * (0.1 + np.log1p(centrality_dict[node])) for node in G_viz.nodes()
+            ]
         else:
-            print(f"Warning: Centrality measure {centrality_size} not found. Using default sizes.")
+            logger.warning(
+                f"Warning: Centrality measure {centrality_size} not found. Using default sizes."
+            )
             node_sizes = [300] * len(G_viz.nodes())
     else:
         node_sizes = [300] * len(G_viz.nodes())
@@ -108,7 +118,7 @@ def visualize_kpi_network(
 
     # Draw edges with width proportional to weight
     for u, v, data in G_viz.edges(data=True):
-        width = 2 * data["weight"]
+        width = 10 * (1 + data["weight"])
         nx.draw_networkx_edges(
             G_viz,
             pos,
@@ -116,7 +126,7 @@ def visualize_kpi_network(
             width=width,
             alpha=0.5,
             arrows=True,
-            arrowsize=15,
+            arrowsize=25,
         )
 
     # Add labels
@@ -127,7 +137,9 @@ def visualize_kpi_network(
 
     # If communities are shown, add a colorbar
     if show_communities and node_colors:
-        sm = plt.cm.ScalarMappable(cmap=plt.cm.viridis, norm=plt.Normalize(min(node_colors), max(node_colors)))
+        sm = plt.cm.ScalarMappable(
+            cmap=plt.cm.viridis, norm=plt.Normalize(min(node_colors), max(node_colors))
+        )
         sm.set_array([])
         divider = make_axes_locatable(plt.gca())
         cax = divider.append_axes("right", "5%", pad="3%")
@@ -262,6 +274,7 @@ def visualize_centrality_distribution(
     plt.tight_layout()
     plt.show()
 
+
 def run_full_analysis(
     mtsn,
     periods: List[int] = [12],
@@ -285,26 +298,22 @@ def run_full_analysis(
     lambda_structure : float
         Weight for structure regularization in graph learning.
     """
-    logging.info("Starting full KPI network analysis with optimized algorithms...")
+    logger = logging.getLogger(__name__)
+    logger.info("Starting full KPI network analysis with optimized algorithms...")
 
     # Step 1: Time series decomposition
-    logging.info("Step 1: Performing multi-seasonal time series decomposition...")
     mtsn.decompose_time_series(periods=periods)
 
     # Step 2: Learn graph structure with optimized methods
-    logging.info("Step 2: Learning graph structure with Virgo initialization and residual aggregation...")
     mtsn.learn_graph_structure(lambda_structure=lambda_structure)
 
     # Step 3: Detect communities
-    logging.info("Step 3: Detecting communities...")
     mtsn.detect_communities(method="spectral", n_communities=n_communities)
 
     # Step 4: Compute centrality measures
-    logging.info("Step 4: Computing centrality measures...")
     mtsn.compute_centrality_measures()
 
     # Step 5: Identify key influencers
-    logging.info("Step 5: Identifying key influencers...")
     key_influencers = mtsn.identify_key_influencers(centrality_type=centrality_type)
 
     # Prepare summary of results
@@ -316,5 +325,7 @@ def run_full_analysis(
         "key_influencers": key_influencers,
     }
 
-    logging.info("KPI network analysis completed successfully with optimized algorithms.")
+    logger.info(
+        "KPI network analysis completed successfully with optimized algorithms."
+    )
     return results_summary

@@ -15,16 +15,18 @@ from statsmodels.tsa.seasonal import MSTL
 
 class MTSN:
     """
-    A class implementing the mathematical framework for network-based analysis of KPIs.
+    Class implementing the mathematical framework for network-based analysis of KPIs.
     Handles temporal dependencies, community detection, and key influencer identification.
     Uses MSTL for multiple seasonal time series decomposition and advanced graph learning techniques.
     """
 
+    logger = logging.getLogger(__name__)
+
     def __init__(
         self,
         alpha: float = 0.1,
-        beta: float = 0.1,
-        gamma: float = 0.1,
+        beta: float = 0.01,
+        gamma: float = 0.05,
         residual_alpha: float = 0.2,
         adaptive_residual: bool = True,
     ):
@@ -91,7 +93,7 @@ class MTSN:
         self.kpi_names = kpi_columns
         self.n_kpis = len(kpi_columns)
 
-        logging.info(
+        self.logger.info(
             f"Loaded data with {self.n_kpis} KPIs and {len(self.kpi_data)} time points."
         )
 
@@ -105,7 +107,7 @@ class MTSN:
                 columns=self.kpi_data.columns,
             )
             self.scaler = scaler  # Store for later inverse transform
-            logging.info("Scaled data with Min-Max scaling.")
+            self.logger.info("Scaled data with Min-Max scaling.")
 
     def decompose_time_series(self, periods: List[int] = [12]) -> Dict:
         """
@@ -126,14 +128,16 @@ class MTSN:
         if not periods:
             if isinstance(self.kpi_data.index, pd.DatetimeIndex):
                 freq = pd.infer_freq(self.kpi_data.index)
-                if freq == 'D':  # Daily data
+                if freq == "D":  # Daily data
                     periods = [7, 30, 365]  # Weekly, monthly, yearly
-                elif freq in ['M', 'MS']:  # Monthly data
+                elif freq in ["M", "MS"]:  # Monthly data
                     periods = [12]  # Yearly
-                elif freq in ['Q', 'QS']:  # Quarterly data
+                elif freq in ["Q", "QS"]:  # Quarterly data
                     periods = [4]  # Quarterly seasonality
                 else:
-                    raise ValueError("Unsupported frequency for automatic period detection.")
+                    raise ValueError(
+                        "Unsupported frequency for automatic period detection."
+                    )
             else:
                 raise ValueError("Date index required for automatic period detection.")
 
@@ -155,7 +159,6 @@ class MTSN:
             residual = result.resid
 
             # For MSTL, the seasonal component is a DataFrame with multiple columns for each seasonal period
-            # We'll store both combined and individual seasonal components
             if isinstance(result.seasonal, pd.Series):
                 seasonal_combined = result.seasonal
             else:
@@ -170,7 +173,7 @@ class MTSN:
                 "original": series,
             }
 
-        logging.info(
+        self.logger.info(
             f"Multi-seasonal time series decomposition completed for {len(self.decomposed_data)} KPIs."
         )
         return self.decomposed_data
@@ -221,7 +224,7 @@ class MTSN:
         if graph_structure is not None:
             # Compute spectral properties of the graph
             try:
-                # Compute largest eigenvalue of the graph Laplacian
+                # Compute the largest eigenvalue of the graph Laplacian
                 L = np.diag(np.sum(graph_structure, axis=1)) - graph_structure
                 eigenvalues = eigh(L, subset_by_index=(L.shape[0] - 1, L.shape[0] - 1))[
                     0
@@ -254,10 +257,14 @@ class MTSN:
         agg_values = np.var(X - X.mean(axis=1).reshape(-1, 1), axis=1)
 
         # Apply smoothing to reduce noise amplification
-        agg_values_smoothed = pd.Series(agg_values).rolling(window=3, min_periods=1).mean().values
+        agg_values_smoothed = (
+            pd.Series(agg_values).rolling(window=3, min_periods=1).mean().values
+        )
 
         # Scale to range [0, 1]
-        agg_values_scaled = (agg_values_smoothed - agg_values_smoothed.min()) / (agg_values_smoothed.max() - agg_values_smoothed.min() + 1e-8)
+        agg_values_scaled = (agg_values_smoothed - agg_values_smoothed.min()) / (
+            agg_values_smoothed.max() - agg_values_smoothed.min() + 1e-8
+        )
 
         return agg_values_scaled
 
@@ -301,7 +308,11 @@ class MTSN:
         # Regularization terms
         frob_reg = self.alpha * np.linalg.norm(A, "fro") ** 2
         l1_reg = self.beta * np.sum(np.abs(A))
-        temporal_reg = self.gamma * np.linalg.norm(A - A_prev, "fro") ** 2 if A_prev is not None else 0
+        temporal_reg = (
+            self.gamma * np.linalg.norm(A - A_prev, "fro") ** 2
+            if A_prev is not None
+            else 0
+        )
 
         # Structural regularization using normalized Laplacian trace
         D = np.diag(np.sum(A, axis=1) + 1e-10)
@@ -368,8 +379,11 @@ class MTSN:
         d = np.diag(D)
 
         # Multi-stage stabilization process
-        d_safe = np.nan_to_num(d, nan=1e-10)  # Handle NaN values
-        d_safe = np.maximum(d_safe, 1e-10)  # Enforce minimum positive threshold
+
+        d_safe = np.nan_to_num(d, nan=np.finfo(float).eps)  # Handle NaN values
+        d_safe = np.maximum(
+            d_safe, np.finfo(float).eps
+        )  # Enforce minimum positive threshold
         d_safe = np.where(d_safe > 1e8, 1e8, d_safe)  # Prevent overflow in reciprocal
 
         D_sqrt_inv = np.diag(1.0 / np.sqrt(d_safe))
@@ -381,7 +395,7 @@ class MTSN:
 
         D_sqrt_inv_grad = np.zeros_like(D_sqrt_inv)
         for i in range(n):
-            if D[i, i] > 1e-10:
+            if D[i, i] > np.finfo(float).eps:
                 D_sqrt_inv_grad[i, i] = -0.5 * (D[i, i] ** (-1.5))
 
         L_normalized_grad = (
@@ -482,7 +496,7 @@ class MTSN:
                     start_date not in self.kpi_data.index
                     or end_date not in self.kpi_data.index
                 ):
-                    logging.warning(
+                    self.logger.warning(
                         f"Window {window_label}: dates not in index, will use nearest available"
                     )
 
@@ -494,9 +508,16 @@ class MTSN:
         A_prev = None  # Initial previous adjacency matrix
 
         for window_label, start_date, end_date in time_windows:
-            if start_date not in self.kpi_data.index or end_date not in self.kpi_data.index:
-                logging.warning(f"Window {window_label}: dates not in index, will use nearest available")
-                start_date = self.kpi_data.index[self.kpi_data.index.searchsorted(start_date)]
+            if (
+                start_date not in self.kpi_data.index
+                or end_date not in self.kpi_data.index
+            ):
+                self.logger.warning(
+                    f"Window {window_label}: dates not in index, will use nearest available"
+                )
+                start_date = self.kpi_data.index[
+                    self.kpi_data.index.searchsorted(start_date)
+                ]
 
             # Extract data for the current time window
             window_data = self.kpi_data.loc[start_date:end_date]
@@ -549,7 +570,7 @@ class MTSN:
                     options={"maxiter": 300, "disp": True},
                 )
             except Exception as e:
-                logging.warning(
+                self.logger.warning(
                     f"Optimization failed: {e}. Using initialization as fallback."
                 )
                 result = type("obj", (object,), {"x": A_init, "success": False})
@@ -595,7 +616,7 @@ class MTSN:
             # Update previous adjacency matrix for temporal consistency
             A_prev = A_residual
 
-        logging.info(
+        self.logger.info(
             f"Graph structure learning completed for {len(self.graph_series)} time windows."
         )
         return self.adjacency_matrices
@@ -646,7 +667,6 @@ class MTSN:
                 L = self.laplacian_matrices[window_label]
 
                 # Compute eigenvectors corresponding to the smallest eigenvalues
-                # Fixed: Using subset_by_index instead of eigvals
                 eigenvalues, eigenvectors = eigh(
                     L, subset_by_index=(0, n_communities - 1)
                 )
@@ -655,7 +675,7 @@ class MTSN:
                 embedding = eigenvectors[:, 1:n_communities]
 
                 # Apply K-means clustering
-                kmeans = KMeans(n_clusters=n_communities, random_state=42)
+                kmeans = KMeans(n_clusters=n_communities, random_state=None)
                 labels = kmeans.fit_predict(embedding)
 
                 # Create partition dictionary
@@ -666,7 +686,7 @@ class MTSN:
 
             self.communities[window_label] = partition
 
-        logging.info(
+        self.logger.info(
             f"Community detection completed for {len(self.communities)} time windows."
         )
         return self.communities
@@ -725,7 +745,7 @@ class MTSN:
                     return centrality
                 except Exception as e:
                     # Fallback to degree centrality if eigenvector calculation fails
-                    logging.warning(f"Eigenvector centrality failed: {e}")
+                    self.logger.warning(f"Eigenvector centrality failed: {e}")
                     return nx.degree_centrality(G)
 
             eigenvector_centrality = perturbed_eigenvector_centrality(G)
@@ -734,7 +754,7 @@ class MTSN:
             try:
                 betweenness_centrality = nx.betweenness_centrality(G, weight="weight")
             except Exception as e:
-                logging.exception(e)
+                self.logger.exception(e)
                 G_undir = G.to_undirected()
                 betweenness_centrality = nx.betweenness_centrality(
                     G_undir, weight="weight"
@@ -757,7 +777,7 @@ class MTSN:
                 "aggregation": aggregation_centrality,
             }
 
-        logging.info(
+        self.logger.info(
             f"Centrality measures computed for {len(self.centrality_measures)} time windows."
         )
         return self.centrality_measures
@@ -876,5 +896,5 @@ class MTSN:
             X_pred, index=data_with_missing.index, columns=data_with_missing.columns
         )
 
-        logging.info(f"Missing value prediction completed.")
+        self.logger.info(f"Missing value prediction completed.")
         return predicted_df
