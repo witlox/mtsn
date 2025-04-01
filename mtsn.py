@@ -5,6 +5,7 @@ from typing import Dict, List, Tuple, Optional
 import networkx as nx
 import numpy as np
 import pandas as pd
+
 from community import community_louvain
 from scipy.linalg import eigh
 from scipy.optimize import minimize
@@ -122,16 +123,19 @@ class MTSN:
         Dict : Dictionary containing decomposed components for each KPI.
         """
         # Auto-detect appropriate periods if not specified
-        if not periods and isinstance(self.kpi_data.index, pd.DatetimeIndex):
-            freq = pd.infer_freq(self.kpi_data.index)
-            if freq == "D":  # Daily data
-                periods = [7, 30, 365]  # Weekly, monthly, yearly
-            elif freq in ["M", "MS"]:  # Monthly data
-                periods = [12]  # Yearly
-            elif freq in ["Q", "QS"]:  # Quarterly data
-                periods = [4]  # Yearly in quarters
+        if not periods:
+            if isinstance(self.kpi_data.index, pd.DatetimeIndex):
+                freq = pd.infer_freq(self.kpi_data.index)
+                if freq == 'D':  # Daily data
+                    periods = [7, 30, 365]  # Weekly, monthly, yearly
+                elif freq in ['M', 'MS']:  # Monthly data
+                    periods = [12]  # Yearly
+                elif freq in ['Q', 'QS']:  # Quarterly data
+                    periods = [4]  # Quarterly seasonality
+                else:
+                    raise ValueError("Unsupported frequency for automatic period detection.")
             else:
-                periods = [12]  # Default to yearly
+                raise ValueError("Date index required for automatic period detection.")
 
         self.decomposed_data = {}
 
@@ -247,24 +251,15 @@ class MTSN:
         np.ndarray : Aggregation values for each KPI
         """
         n = X.shape[0]
-        agg_values = np.zeros(n)
+        agg_values = np.var(X - X.mean(axis=1).reshape(-1, 1), axis=1)
 
-        # Compute variance of each KPI
-        for i in range(n):
-            # Normalize the values
-            normalized = (X[i] - np.mean(X[i])) / (np.std(X[i]) + 1e-8)
-            # Compute aggregation value as variance of normalized values
-            agg_values[i] = np.var(normalized)
+        # Apply smoothing to reduce noise amplification
+        agg_values_smoothed = pd.Series(agg_values).rolling(window=3, min_periods=1).mean().values
 
         # Scale to range [0, 1]
-        if np.max(agg_values) - np.min(agg_values) > 0:
-            agg_values = (agg_values - np.min(agg_values)) / (
-                np.max(agg_values) - np.min(agg_values)
-            )
-        else:
-            agg_values = np.ones_like(agg_values) * 0.5
+        agg_values_scaled = (agg_values_smoothed - agg_values_smoothed.min()) / (agg_values_smoothed.max() - agg_values_smoothed.min() + 1e-8)
 
-        return agg_values
+        return agg_values_scaled
 
     def _objective_function(
         self,
@@ -292,7 +287,6 @@ class MTSN:
         float : Value of the objective function.
         """
         n = self.n_kpis
-        # Reshape the flattened array back to a matrix, ensuring zeros on diagonal
         A = np.zeros((n, n))
         idx = 0
         for i in range(n):
@@ -301,32 +295,17 @@ class MTSN:
                     A[i, j] = A_flat[idx]
                     idx += 1
 
-        # Reconstruction term
+        # Reconstruction error term
         recon_error = np.linalg.norm(X - A @ X, "fro") ** 2
 
         # Regularization terms
         frob_reg = self.alpha * np.linalg.norm(A, "fro") ** 2
         l1_reg = self.beta * np.sum(np.abs(A))
+        temporal_reg = self.gamma * np.linalg.norm(A - A_prev, "fro") ** 2 if A_prev is not None else 0
 
-        # Temporal consistency term
-        temporal_reg = 0
-        if A_prev is not None:
-            temporal_reg = self.gamma * np.linalg.norm(A - A_prev, "fro") ** 2
-
-        # Add structural term to encourage community structure
-        # Compute the normalized graph Laplacian trace
-        D = np.diag(
-            np.sum(A, axis=1) + 1e-10
-        )  # Add small epsilon to avoid division by zero
-        D_diag = np.diag(D) + 1e-10
-        # Ensure values are non-negative before sqrt
-        D_diag_safe = np.maximum(D_diag, 0)
-        # Compute sqrt only for positive values
-        D_sqrt_inv_diag = np.zeros_like(D_diag)
-        mask = D_diag_safe > 0
-        D_sqrt_inv_diag[mask] = 1.0 / np.sqrt(D_diag_safe[mask])
-        D_sqrt_inv = np.diag(D_sqrt_inv_diag)
-
+        # Structural regularization using normalized Laplacian trace
+        D = np.diag(np.sum(A, axis=1) + 1e-10)
+        D_sqrt_inv = np.diag(1.0 / np.sqrt(np.maximum(D.diagonal(), 1e-10)))
         L_normalized = np.eye(n) - D_sqrt_inv @ A @ D_sqrt_inv
         structure_reg = lambda_structure * np.trace(L_normalized)
 
@@ -515,6 +494,10 @@ class MTSN:
         A_prev = None  # Initial previous adjacency matrix
 
         for window_label, start_date, end_date in time_windows:
+            if start_date not in self.kpi_data.index or end_date not in self.kpi_data.index:
+                logging.warning(f"Window {window_label}: dates not in index, will use nearest available")
+                start_date = self.kpi_data.index[self.kpi_data.index.searchsorted(start_date)]
+
             # Extract data for the current time window
             window_data = self.kpi_data.loc[start_date:end_date]
 
@@ -642,10 +625,9 @@ class MTSN:
         for window_label, G in self.graph_series.items():
             if method == "walktrap":
                 # For walktrap, convert to undirected graph with weights
-                G_undir = G.to_undirected()
-                # Use community_louvain as an approximation to walktrap
                 import igraph
 
+                G_undir = G.to_undirected()
                 G_igraph = igraph.Graph.Weighted_Adjacency(G_undir)
                 partition = G_igraph.community_walktrap().as_clustering().membership
 
@@ -896,69 +878,3 @@ class MTSN:
 
         logging.info(f"Missing value prediction completed.")
         return predicted_df
-
-    def run_full_analysis(
-        self,
-        periods: List[int] = [12],
-        n_communities: int = 3,
-        centrality_type: str = "eigenvector",
-        lambda_structure: float = 0.1,
-    ) -> Dict:
-        """
-        Run the complete KPI network analysis pipeline with optimized algorithms.
-
-        Parameters:
-        -----------
-        periods : List[int]
-            List of seasonal periods for multi-seasonal time series decomposition.
-        n_communities : int
-            Number of communities to detect.
-        centrality_type : str
-            Type of centrality to use for key influencer identification.
-        lambda_structure : float
-            Weight for structure regularization in graph learning.
-
-        Returns:
-        --------
-        Dict : Summary of analysis results.
-        """
-        if self.kpi_data is None:
-            raise ValueError("Data must be loaded first.")
-
-        logging.info("Starting full KPI network analysis with optimized algorithms...")
-
-        # Step 1: Time series decomposition
-        logging.info("Step 1: Performing multi-seasonal time series decomposition...")
-        self.decompose_time_series(periods=periods)
-
-        # Step 2: Learn graph structure with optimized methods
-        logging.info(
-            "Step 2: Learning graph structure with Virgo initialization and residual aggregation..."
-        )
-        self.learn_graph_structure(lambda_structure=lambda_structure)
-
-        # Step 3: Detect communities
-        logging.info("Step 3: Detecting communities...")
-        self.detect_communities(method="spectral", n_communities=n_communities)
-
-        # Step 4: Compute centrality measures
-        logging.info("Step 4: Computing centrality measures...")
-        self.compute_centrality_measures()
-
-        # Step 5: Identify key influencers
-        logging.info("Step 5: Identifying key influencers...")
-        key_influencers = self.identify_key_influencers(centrality_type=centrality_type)
-
-        # Prepare summary of results
-        results_summary = {
-            "n_kpis": self.n_kpis,
-            "time_periods": len(self.kpi_data),
-            "periods_analyzed": periods,
-            "communities": self.communities,
-            "key_influencers": key_influencers,
-        }
-
-        logging.info(
-            "KPI network analysis completed successfully with optimized algorithms."
-        )
-        return results_summary
